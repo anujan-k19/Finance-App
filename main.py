@@ -68,7 +68,6 @@ def index():
     except requests.exceptions.HTTPError as e:
         # A 401 Unauthorized error from the API likely means the access_token has expired.
         if e.response.status_code == 401:
-            print("Access token expired or invalid. Logging out.")
             print("Access token expired or invalid. Attempting to refresh...")
             refresh_token = session.get("refresh_token")
             if not refresh_token:
@@ -87,8 +86,6 @@ def index():
         else:
             # For other HTTP errors, we can log them.
             print(f"An HTTP error occurred: {e}")
-        # Potentially a token expiry, clear session and ask to reconnect
-        return redirect(url_for("logout"))
             return redirect(url_for("logout"))
 
 @app.route('/connect')
