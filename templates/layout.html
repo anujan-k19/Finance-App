@@ -10,8 +10,19 @@
 </head>
 <body>
     <div class="container">
-        {% block content %}{% endblock %}
+        <div id="root"></div>
     </div>
-    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <!-- React and Babel for in-browser JSX transformation -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/history@5/umd/history.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-router@6.3.0/umd/react-router.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-router-dom@6.3.0/umd/react-router-dom.development.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/hooks.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/components.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/pages.js') }}"></script>
+    <script type="text/babel" src="{{ url_for('static', filename='js/app.js') }}"></script>
 </body>
 </html>
