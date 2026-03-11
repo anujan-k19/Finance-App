@@ -1,0 +1,56 @@
+{% extends "layout.html" %}
+
+{% block content %}
+    <h1>My Finance Dashboard</h1>
+
+    {% if not accounts_data %}
+        <p>Connect your bank accounts to see your financial overview.</p>
+        <a href="{{ url_for('connect') }}" class="button">Connect with TrueLayer</a>
+    {% else %}
+        <p><a href="{{ url_for('logout') }}">Disconnect and clear session</a></p>
+        <h2>Accounts Overview</h2>
+        {% for account in accounts_data %}
+            <div class="account">
+                <h3>{{ account.display_name }} ({{ account.account_type }})</h3>
+                <p><strong>Provider:</strong> {{ account.provider.display_name }}</p>
+                <p><strong>Balance:</strong> {{ account.balance.current }} {{ account.balance.currency }}</p>
+
+                <h4>Transactions ({{ account.transactions_by_month.keys()|list|first }})</h4>
+                {% set month = account.transactions_by_month.keys()|list|first %}
+                {% if account.transactions_by_month[month] %}
+                    <table border="1" style="width:100%; border-collapse: collapse;">
+                        <thead>
+                            <tr>
+                                <th style="padding: 8px; text-align: left;">Date</th>
+                                <th style="padding: 8px; text-align: left;">Description</th>
+                                <th style="padding: 8px; text-align: right;">Amount</th>
+                                <th style="padding: 8px; text-align: left;">Category</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                        {% for tx in account.transactions_by_month[month] %}
+                            <tr>
+                                <td style="padding: 8px;">{{ tx.timestamp.split('T')[0] }}</td>
+                                <td style="padding: 8px;">{{ tx.description }}</td>
+                                <td style="padding: 8px; text-align: right;">{{ tx.amount }}</td>
+                                <td style="padding: 8px;">{{ tx.transaction_category }}</td>
+                            </tr>
+                        {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p>No transactions found for this month.</p>
+                {% endif %}
+            </div>
+            <hr>
+        {% endfor %}
+    {% endif %}
+
+    <style>
+        .account { margin-bottom: 2rem; }
+        h3 { border-bottom: 1px solid #eee; padding-bottom: 0.5rem; }
+        table { margin-top: 1rem; }
+        th, td { vertical-align: top; }
+    </style>
+
+{% endblock %}
