@@ -3,15 +3,35 @@
  * Fetches and displays the financial overview, summary cards, and account sections.
  */
 function Dashboard() {
-    const { useState } = React;
+    const { useState, useRef, useEffect } = React;
     const { data, loading, error, refetch } = useFetch('/api/dashboard');
     const [selectedAccount, setSelectedAccount] = useState(null);
+    const accountsContainerRef = useRef(null); // Ref for the top of the accounts sections
+    const transactionListRef = useRef(null); // Ref for the transaction list container
+
+    // Effect to scroll to the transaction list when an account is selected
+    useEffect(() => {
+        if (selectedAccount && transactionListRef.current) {
+            // A small delay ensures the element is fully rendered before scrolling
+            setTimeout(() => {
+                transactionListRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
+        }
+    }, [selectedAccount]);
+
+    // Centralized function to handle closing the detail view and scrolling up.
+    const handleCloseDetails = () => {
+        setSelectedAccount(null);
+        if (accountsContainerRef.current) {
+            accountsContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    };
 
     // Handles the click event on an account card to show/hide the transaction detail view.
     const handleAccountSelect = (account) => {
-        // If clicking the same account, deselect it. Otherwise, select the new one.
+        // If clicking the same account, deselect it and scroll up. Otherwise, select the new one.
         if (selectedAccount && selectedAccount.account_id === account.account_id) {
-            setSelectedAccount(null);
+            handleCloseDetails();
         } else {
             setSelectedAccount(account);
         }
@@ -59,26 +79,30 @@ function Dashboard() {
                 </div>
             )}
 
-            <AccountSection 
-                title="Credit Cards" 
-                accounts={data.credit_cards} 
-                onAccountSelect={handleAccountSelect}
-                selectedAccountId={selectedAccount?.account_id}
-            />
-            <AccountSection 
-                title="Savings Accounts" 
-                accounts={data.savings_accounts} 
-                onAccountSelect={handleAccountSelect}
-                selectedAccountId={selectedAccount?.account_id}
-            />
-            <AccountSection 
-                title="Current Accounts" 
-                accounts={data.debit_accounts} 
-                onAccountSelect={handleAccountSelect}
-                selectedAccountId={selectedAccount?.account_id}
-            />
+            <div ref={accountsContainerRef}>
+                <AccountSection 
+                    title="Credit Cards" 
+                    accounts={data.credit_cards} 
+                    onAccountSelect={handleAccountSelect}
+                    selectedAccountId={selectedAccount?.account_id}
+                />
+                <AccountSection 
+                    title="Savings Accounts" 
+                    accounts={data.savings_accounts} 
+                    onAccountSelect={handleAccountSelect}
+                    selectedAccountId={selectedAccount?.account_id}
+                />
+                <AccountSection 
+                    title="Current Accounts" 
+                    accounts={data.debit_accounts} 
+                    onAccountSelect={handleAccountSelect}
+                    selectedAccountId={selectedAccount?.account_id}
+                />
+            </div>
 
-            {selectedAccount && <TransactionList account={selectedAccount} onClose={() => setSelectedAccount(null)} />}
+            <div ref={transactionListRef}>
+                {selectedAccount && <TransactionList account={selectedAccount} onClose={handleCloseDetails} />}
+            </div>
         </div>
     );
 }
@@ -88,13 +112,43 @@ function Dashboard() {
  * Fetches and displays spending data in a chart, allowing users to filter by month.
  */
 function Breakdown() {
-    const { useState } = React;
+    const { useState, useRef, useEffect } = React;
     // Default to current month YYYY-MM
     const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
+    const [selectedCategory, setSelectedCategory] = useState(null);
+    const transactionListRef = useRef(null); // Ref for the transaction list
+    const chartContainerRef = useRef(null); // Ref for the chart container to scroll back to
     const { data: chartData, loading, error } = useFetch(`/api/breakdown?month=${month}`);
+
+    // Effect to scroll to the transaction list when a category is selected
+    useEffect(() => {
+        if (selectedCategory && transactionListRef.current) {
+            setTimeout(() => {
+                transactionListRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }, 100);
+        }
+    }, [selectedCategory]);
+
+    const handleCloseDetails = () => {
+        setSelectedCategory(null);
+        if (chartContainerRef.current) {
+            chartContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+    };
 
     const handleMonthChange = (e) => {
         setMonth(e.target.value);
+        // Reset selected category when month changes
+        handleCloseDetails();
+    };
+
+    const handleCategoryClick = (category) => {
+        // Toggle behavior: if the same category is clicked, hide the list.
+        if (selectedCategory === category) {
+            handleCloseDetails();
+        } else {
+            setSelectedCategory(category);
+        }
     };
 
     if (loading) {
@@ -132,8 +186,20 @@ function Breakdown() {
                 />
             </div>
 
-            <h2>{chartData.month}</h2>
-            <SpendingChart data={chartData} />
+            <div ref={chartContainerRef}>
+                <h2>{chartData.month}</h2>
+                <SpendingChart data={chartData} onCategoryClick={handleCategoryClick} />
+            </div>
+
+            <div ref={transactionListRef}>
+                {selectedCategory && (
+                    <CategoryTransactionList 
+                        category={selectedCategory} 
+                        month={month} 
+                        onClose={handleCloseDetails} 
+                    />
+                )}
+            </div>
         </div>
     );
 }
@@ -153,7 +219,29 @@ function Transactions() {
         setPage(1);
     };
 
-    const { data, loading, error } = useFetch(`/api/transactions?page=${page}&search=${encodeURIComponent(searchTerm)}`);
+    const { data, loading, error, refetch } = useFetch(`/api/transactions?page=${page}&search=${encodeURIComponent(searchTerm)}`);
+    const { data: categories } = useFetch('/api/categories');
+
+    const handleCategoryChange = async (transactionId, newCategory) => {
+        try {
+            const response = await fetch('/api/categorize', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    transaction_id: transactionId,
+                    category: newCategory,
+                }),
+            });
+            if (!response.ok) {
+                throw new Error('Failed to update category');
+            }
+            refetch(); // Refetch transactions to show the update
+        } catch (err) {
+            console.error("Category update failed:", err);
+        }
+    };
 
     if (loading) {
         return (
@@ -182,7 +270,6 @@ function Transactions() {
             <table className="transaction-table">
                 <thead>
                     <tr>
-                        <th>Date</th>
                         <th>Description</th>
                         <th>Category</th>
                         <th>Account</th>
@@ -190,17 +277,29 @@ function Transactions() {
                     </tr>
                 </thead>
                 <tbody>
-                    {transactions.map((tx, index) => (
-                        <tr key={index}>
-                            <td>{tx.timestamp.split('T')[0]}</td>
-                            <td>{tx.description}</td>
-                            <td>{tx.transaction_category}</td>
-                            <td>{tx.account_name}</td>
-                            <td style={{ textAlign: 'right', fontWeight: tx.amount > 0 ? 'bold' : 'normal', color: tx.amount > 0 ? '#28a745' : 'inherit' }}>
-                                {tx.amount.toFixed(2)} {tx.currency}
-                            </td>
-                        </tr>
-                    ))}
+                    {transactions.reduce((acc, tx, index) => {
+                        const date = tx.timestamp.split('T')[0];
+                        const prevDate = index > 0 ? transactions[index - 1].timestamp.split('T')[0] : null;
+                        if (date !== prevDate) {
+                            acc.push(
+                                <tr key={`date-${date}`} className="date-header-row">
+                                    <td colSpan="4" style={{ fontWeight: 'bold', backgroundColor: '#f8f9fa', color: '#555', padding: '0.5rem 1rem' }}>
+                                        {new Date(date).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                                    </td>
+                                </tr>
+                            );
+                        }
+                        acc.push(
+                            <TransactionRow 
+                                key={tx.transaction_id} 
+                                transaction={tx} 
+                                categories={categories || []}
+                                onCategoryChange={handleCategoryChange}
+                                showAccountName={true}
+                            />
+                        );
+                        return acc;
+                    }, [])}
                 </tbody>
             </table>
 

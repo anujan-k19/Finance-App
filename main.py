@@ -16,6 +16,44 @@ load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET_KEY")
 
+# --- Transaction Categorization Logic ---
+
+# A simple rule-based categorizer. In a real-world app, this could be more complex,
+# stored in a database, or use a machine learning model.
+MERCHANT_TO_CATEGORY = {
+    # Groceries
+    "tesco": "Groceries", "sainsbury's": "Groceries", "asda": "Groceries",
+    "morrisons": "Groceries", "lidl": "Groceries", "aldi": "Groceries",
+    "waitrose": "Groceries", "co-op": "Groceries", "iceland": "Groceries",
+    "ocado": "Groceries",
+    # Transport
+    "tfl": "Transport", "uber": "Transport", "bolt": "Transport",
+    "trainline": "Transport", "national express": "Transport",
+    "shell": "Petrol", "bp": "Petrol", "esso": "Petrol",
+    # Food & Drink
+    "starbucks": "Coffee", "costa": "Coffee", "pret a manger": "Eating Out",
+    "mcdonald's": "Eating Out", "kfc": "Eating Out", "nando's": "Eating Out",
+    "deliveroo": "Takeaway", "just eat": "Takeaway", "uber eats": "Takeaway",
+    # Shopping
+    "amazon": "Shopping", "ebay": "Shopping", "asos": "Shopping", "zara": "Shopping",
+    # Utilities & Bills
+    "thames water": "Utilities", "british gas": "Utilities", "edf": "Utilities",
+    "bt": "Bills", "sky": "Bills", "virgin media": "Bills",
+    "netflix": "Bills", "spotify": "Bills",
+}
+
+# Add some common categories that might not be in the rules.
+ADDITIONAL_CATEGORIES = ["General", "Income", "Transfers", "Entertainment", "Health"]
+
+def categorize_transaction(description):
+    """Categorizes a transaction based on keywords in its description."""
+    if not description:
+        return "General"
+    description_lower = description.lower()
+    for merchant, category in MERCHANT_TO_CATEGORY.items():
+        if merchant in description_lower:
+            return category
+    return "General"  # Default category if no match is found
 
 def token_required(f):
     """Decorator to check for access token and handle token refresh."""
@@ -162,12 +200,18 @@ def get_breakdown_data(access_token):
 
     # Calculate total spending for each category in the target month.
     spending_by_category = defaultdict(float)
+    overrides = session.get('category_overrides', {})
 
     for tx in all_transactions:
         tx_month = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m')
         if tx_month == target_month_str and tx['amount'] < 0:
-            # Only sum negative amounts (spending) and use absolute value for the chart.
-            spending_by_category[tx['transaction_category']] += abs(tx['amount'])
+            tx_id = tx.get('transaction_id')
+            # Use our custom categorization logic for grouping
+            if tx_id and tx_id in overrides:
+                category = overrides[tx_id]
+            else:
+                category = categorize_transaction(tx.get('description'))
+            spending_by_category[category] += abs(tx['amount'])
 
     sorted_spending = sorted(spending_by_category.items(), key=lambda item: item[1], reverse=True)
 
@@ -197,6 +241,15 @@ def get_single_account_transactions(access_token):
     else:
         transactions = truelayer_api.get_account_transactions(access_token, account_id)
 
+    overrides = session.get('category_overrides', {})
+    # Add our custom category to each transaction
+    for tx in transactions:
+        tx_id = tx.get('transaction_id')
+        if tx_id and tx_id in overrides:
+            tx['display_category'] = overrides[tx_id]
+        else:
+            tx['display_category'] = categorize_transaction(tx.get('description'))
+
     # Sort by date descending (newest first)
     transactions.sort(key=lambda x: x['timestamp'], reverse=True)
     # Return only the top 15 most recent transactions for the detail view.
@@ -213,6 +266,7 @@ def get_transactions_data(access_token):
     accounts = truelayer_api.get_accounts(access_token)
     cards = truelayer_api.get_cards(access_token)
 
+    overrides = session.get('category_overrides', {})
     # Aggregate transactions from all accounts, adding the account name for context.
     all_transactions = []
 
@@ -221,16 +275,40 @@ def get_transactions_data(access_token):
         txs = truelayer_api.get_account_transactions(access_token, account["account_id"])
         for tx in txs:
             tx['account_name'] = account['display_name']
+            tx_id = tx.get('transaction_id')
+            # Add our custom category
+            if tx_id and tx_id in overrides:
+                tx['display_category'] = overrides[tx_id]
+            else:
+                tx['display_category'] = categorize_transaction(tx.get('description'))
             all_transactions.append(tx)
 
     for card in cards:
         txs = truelayer_api.get_card_transactions(access_token, card["account_id"])
         for tx in txs:
             tx['account_name'] = card['display_name']
+            tx_id = tx.get('transaction_id')
+            # Add our custom category
+            if tx_id and tx_id in overrides:
+                tx['display_category'] = overrides[tx_id]
+            else:
+                tx['display_category'] = categorize_transaction(tx.get('description'))
             all_transactions.append(tx)
 
     # Sort by date descending (newest first)
     all_transactions.sort(key=lambda x: x['timestamp'], reverse=True)
+
+    # --- Month Filter ---
+    # Allows fetching transactions for a specific month, used by the breakdown drill-down.
+    month_filter = request.args.get('month')
+    if month_filter:
+        all_transactions = [tx for tx in all_transactions if tx['timestamp'].startswith(month_filter)]
+
+    # --- Category Filter ---
+    # Allows fetching transactions for a specific category, used by the breakdown drill-down.
+    category_filter = request.args.get('category')
+    if category_filter:
+        all_transactions = [tx for tx in all_transactions if tx.get('display_category') == category_filter]
 
     # If a search query is provided, filter transactions by description or amount.
     # --- Search Logic ---
@@ -265,6 +343,38 @@ def get_transactions_data(access_token):
             "has_next": page < total_pages
         }
     })
+
+
+@app.route('/api/categories')
+@token_required
+def get_categories(access_token):
+    """Returns a list of available transaction categories."""
+    # Get all unique categories from the rules
+    categories = set(MERCHANT_TO_CATEGORY.values())
+    # Add any other predefined categories
+    categories.update(ADDITIONAL_CATEGORIES)
+    return jsonify(sorted(list(categories)))
+
+
+@app.route('/api/categorize', methods=['POST'])
+@token_required
+def set_transaction_category(access_token):
+    """Sets a manual category override for a given transaction."""
+    data = request.get_json()
+    transaction_id = data.get('transaction_id')
+    category = data.get('category')
+
+    if not transaction_id or not category:
+        return jsonify({"error": "transaction_id and category are required"}), 400
+
+    # Initialize overrides dict in session if it doesn't exist
+    if 'category_overrides' not in session:
+        session['category_overrides'] = {}
+
+    session['category_overrides'][transaction_id] = category
+    session.modified = True  # Explicitly mark session as modified
+    
+    return jsonify({"success": True, "transaction_id": transaction_id, "category": category})
 
 
 @app.route('/connect')
