@@ -4,6 +4,7 @@ from itertools import groupby
 
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, session, url_for
+import requests
 
 import truelayer_api
 
@@ -21,12 +22,17 @@ def index():
     """
     access_token = session.get("access_token")
     if not access_token:
-        return render_template("index.html", accounts_data=None)
+        return render_template("index.html", has_data=False)
 
     try:
         # Fetch accounts and cards
         accounts = truelayer_api.get_accounts(access_token)
         cards = truelayer_api.get_cards(access_token)
+
+        # Add 'account_type' to card objects for consistent processing, resolving the KeyError.
+        for card in cards:
+            card['account_type'] = 'CARD'
+
         all_accounts = accounts + cards
 
         # Fetch balance and transactions for each account
@@ -46,12 +52,44 @@ def index():
                 for month, txs in groupby(transactions, key=lambda x: datetime.fromisoformat(x['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m'))
             }
 
-        return render_template("index.html", accounts_data=all_accounts)
+        # Filter accounts into categories for the tabbed view
+        credit_cards = [acc for acc in all_accounts if acc['account_type'] == 'CARD']
+        savings_accounts = [acc for acc in all_accounts if acc['account_type'] == 'SAVING']
+        debit_accounts = [acc for acc in all_accounts if acc['account_type'] == 'TRANSACTION']
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        return render_template(
+            "index.html",
+            has_data=bool(all_accounts),
+            credit_cards=credit_cards,
+            savings_accounts=savings_accounts,
+            debit_accounts=debit_accounts
+        )
+
+    except requests.exceptions.HTTPError as e:
+        # A 401 Unauthorized error from the API likely means the access_token has expired.
+        if e.response.status_code == 401:
+            print("Access token expired or invalid. Logging out.")
+            print("Access token expired or invalid. Attempting to refresh...")
+            refresh_token = session.get("refresh_token")
+            if not refresh_token:
+                print("No refresh token available. Logging out.")
+                return redirect(url_for("logout"))
+
+            try:
+                new_token_data = truelayer_api.refresh_access_token(refresh_token)
+                session["access_token"] = new_token_data["access_token"]
+                session["refresh_token"] = new_token_data.get("refresh_token", refresh_token)
+                print("Token refreshed successfully. Reloading page.")
+                return redirect(url_for("index"))
+            except requests.exceptions.HTTPError as refresh_error:
+                print(f"Failed to refresh token: {refresh_error}. Logging out.")
+                return redirect(url_for("logout"))
+        else:
+            # For other HTTP errors, we can log them.
+            print(f"An HTTP error occurred: {e}")
         # Potentially a token expiry, clear session and ask to reconnect
         return redirect(url_for("logout"))
+            return redirect(url_for("logout"))
 
 @app.route('/connect')
 def connect():
@@ -65,6 +103,8 @@ def callback():
     code = request.args.get("code")
     token_data = truelayer_api.exchange_code_for_token(code)
     session["access_token"] = token_data["access_token"]
+    # Store the refresh_token as well to handle future token expiry
+    session["refresh_token"] = token_data["refresh_token"]
     return redirect(url_for("index"))
 
 @app.route('/logout')
