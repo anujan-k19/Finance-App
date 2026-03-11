@@ -5,8 +5,9 @@ function App() {
         <BrowserRouter>
             <Routes>
                 <Route path="/" element={<Layout />}>
-                    <Route index element={<Dashboard />} />
-                    <Route path="breakdown" element={<Breakdown />} />
+                    <Route index element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
+                    <Route path="transactions" element={<ErrorBoundary><Transactions /></ErrorBoundary>} />
+                    <Route path="breakdown" element={<ErrorBoundary><Breakdown /></ErrorBoundary>} />
                 </Route>
             </Routes>
         </BrowserRouter>

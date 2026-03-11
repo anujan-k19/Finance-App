@@ -1,40 +1,133 @@
 // A component to display a single account
-function Account({ account }) {
+function Account({ account, onClick, isSelected }) {
+    const cardClass = `account ${isSelected ? 'selected' : ''}`;
     return (
-        <div className="account">
-            <h3>{account.display_name}</h3>
-            <p><strong>Provider:</strong> {account.provider.display_name}</p>
-            <p><strong>Balance:</strong> {account.balance.current} {account.balance.currency}</p>
-            <hr />
+        <div className={cardClass} onClick={onClick}>
+            <div className="account-card-header">
+                <h3>{account.display_name}</h3>
+                <span className="account-provider">{account.provider.display_name}</span>
+            </div>
+            <div className="account-card-body">
+                <p className="account-balance">
+                    {account.balance.current.toLocaleString('en-GB', { style: 'currency', currency: account.balance.currency || 'GBP' })}
+                </p>
+            </div>
+        </div>
+    );
+}
+
+// A card to display a high-level summary stat
+function SummaryCard({ title, value, currency, isChange }) {
+    const numericValue = parseFloat(value);
+    const formattedValue = numericValue.toLocaleString('en-GB', { style: 'currency', currency: currency || 'GBP' });
+    
+    let valueClass = "summary-value";
+    if (isChange) {
+        valueClass += numericValue >= 0 ? " positive" : " negative";
+    }
+
+    return (
+        <div className="summary-card">
+            <div className="summary-title">{title}</div>
+            <div className={valueClass}>{formattedValue}</div>
+        </div>
+    );
+}
+
+// A reusable loading spinner component
+function LoadingSpinner() {
+    return (
+        <div className="spinner-container">
+            <div className="loading-spinner"></div>
         </div>
     );
 }
 
 // Component to display a section of accounts
-function AccountSection({ title, accounts }) {
+function AccountSection({ title, accounts, onAccountSelect, selectedAccountId }) {
     return (
-        <div>
+        <div className="account-section">
             <h2>{title}</h2>
-            {accounts && accounts.length > 0 ? (
-                accounts.map(acc => <Account key={acc.account_id} account={acc} />)
-            ) : (
-                <p>No {title.toLowerCase()} found.</p>
+            <div className="account-grid">
+                {accounts && accounts.length > 0 ? (
+                    accounts.map(acc => 
+                        <Account 
+                            key={acc.account_id} 
+                            account={acc} 
+                            onClick={() => onAccountSelect(acc)}
+                            isSelected={selectedAccountId === acc.account_id}
+                        />
+                    )
+                ) : (
+                    <p>No {title.toLowerCase()} found.</p>
+                )}
+            </div>
+        </div>
+    );
+}
+
+function TransactionList({ account, onClose }) {
+    const { data: transactions, loading, error } = useFetch(`/api/account_transactions?account_id=${account.account_id}&account_type=${account.account_type}`);
+
+    return (
+        <div className="transaction-detail-view">
+            <div className="transaction-detail-header">
+                <h3>Recent Transactions for {account.display_name}</h3>
+                <button onClick={onClose} className="close-button">&times;</button>
+            </div>
+            {loading && <LoadingSpinner />}
+            {error && <p>Error loading transactions.</p>}
+            {transactions && (
+                <table className="transaction-table">
+                    <thead>
+                        <tr>
+                            <th>Date</th>
+                            <th>Description</th>
+                            <th style={{ textAlign: 'right' }}>Amount</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {transactions.length > 0 ? transactions.map((tx, index) => (
+                            <tr key={tx.transaction_id || index}>
+                                <td>{tx.timestamp.split('T')[0]}</td>
+                                <td>{tx.description}</td>
+                                <td style={{ textAlign: 'right', color: tx.amount > 0 ? '#28a745' : 'inherit' }}>
+                                    {tx.amount.toLocaleString('en-GB', { style: 'currency', currency: tx.currency || 'GBP' })}
+                                </td>
+                            </tr>
+                        )) : (
+                            <tr><td colSpan="3" style={{textAlign: 'center', padding: '1rem'}}>No recent transactions found.</td></tr>
+                        )}
+                    </tbody>
+                </table>
             )}
         </div>
     );
 }
 
 function Layout() {
+    const { useState } = React;
     const { Link, Outlet } = ReactRouterDOM;
+    const [isMenuOpen, setIsMenuOpen] = useState(false);
+
+    const toggleMenu = () => setIsMenuOpen(!isMenuOpen);
+    const closeMenu = () => setIsMenuOpen(false);
+
     return (
         <div>
             <nav className="navbar">
                 <div className="container">
-                    <Link className="nav-brand" to="/">Finance Dashboard</Link>
-                    <ul className="nav-links">
-                        <li><Link to="/">Dashboard</Link></li>
-                        <li><Link to="/breakdown">Spending Breakdown</Link></li>
-                        <li><a href="/logout">Logout</a></li>
+                    <Link className="nav-brand" to="/" onClick={closeMenu}>Finance Dashboard</Link>
+                    <button className="hamburger-menu" onClick={toggleMenu}>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </button>
+                    <ul className={`nav-links ${isMenuOpen ? 'active' : ''}`}>
+                        <li><Link to="/" onClick={closeMenu}>Dashboard</Link></li>
+                        <li><Link to="/transactions" onClick={closeMenu}>Transactions</Link></li>
+                        <li><Link to="/breakdown" onClick={closeMenu}>Spending Breakdown</Link></li>
+                        <li><a href="/logout" onClick={closeMenu}>Logout</a></li>
                     </ul>
                 </div>
             </nav>
@@ -96,4 +189,38 @@ function SpendingChart({ data }) {
             <canvas ref={chartRef}></canvas>
         </div>
     );
+}
+
+class ErrorBoundary extends React.Component {
+    constructor(props) {
+        super(props);
+        this.state = { hasError: false, error: null };
+    }
+
+    static getDerivedStateFromError(error) {
+        // Update state so the next render will show the fallback UI.
+        return { hasError: true, error };
+    }
+
+    componentDidCatch(error, errorInfo) {
+        // You can also log the error to an error reporting service
+        console.error("ErrorBoundary caught an error", error, errorInfo);
+    }
+
+    render() {
+        if (this.state.hasError) {
+            // You can render any custom fallback UI
+            return (
+                <div className="error-boundary-container" style={{ padding: '2rem', textAlign: 'center', background: '#fff0f0', border: '1px solid #ffcccc', borderRadius: '8px', margin: '2rem 0' }}>
+                    <h2 style={{ color: '#d32f2f' }}>Something went wrong.</h2>
+                    <p>We're sorry, but we were unable to load this section.</p>
+                    <details style={{ whiteSpace: 'pre-wrap', marginTop: '1rem', color: '#555', textAlign: 'left' }}>
+                        {this.state.error && this.state.error.toString()}
+                    </details>
+                </div>
+            );
+        }
+
+        return this.props.children; 
+    }
 }

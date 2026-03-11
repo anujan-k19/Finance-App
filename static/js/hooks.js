@@ -4,9 +4,15 @@ function useFetch(url) {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
+    const [trigger, setTrigger] = useState(0);
+
+    const refetch = () => {
+        setTrigger(t => t + 1);
+    };
 
     useEffect(() => {
         const fetchData = async () => {
+            setLoading(true);
             try {
                 const response = await fetch(url);
                 if (!response.ok) {
@@ -26,7 +32,7 @@ function useFetch(url) {
             }
         };
         fetchData();
-    }, [url]);
+    }, [url, trigger]);
 
-    return { data, loading, error };
+    return { data, loading, error, refetch };
 }

@@ -3,6 +3,7 @@ from datetime import datetime
 from itertools import groupby
 
 from functools import wraps
+import math
 from collections import defaultdict
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, session, url_for, jsonify
@@ -68,6 +69,7 @@ def get_dashboard_data(access_token):
     Fetches all account and balance data and returns it as JSON.
     """
     accounts = truelayer_api.get_accounts(access_token)
+    # cards might be empty if the provider doesn't support it or user has none
     cards = truelayer_api.get_cards(access_token)
 
     for card in cards:
@@ -75,18 +77,51 @@ def get_dashboard_data(access_token):
 
     all_accounts = accounts + cards
 
+    total_balance = 0.0
+    total_assets = 0.0
+    total_liabilities = 0.0
+    todays_change = 0.0
+    today_str = datetime.now().strftime('%Y-%m-%d')
+
     for account in all_accounts:
         account_id = account["account_id"]
+        balance = 0.0
+        transactions = []
+
         if account["account_type"] == "CARD":
-            account["balance"] = truelayer_api.get_card_balance(access_token, account_id)
+            balance_data = truelayer_api.get_card_balance(access_token, account_id)
+            account["balance"] = balance_data
+            transactions = truelayer_api.get_card_transactions(access_token, account_id)
         else:
-            account["balance"] = truelayer_api.get_account_balance(access_token, account_id)
+            balance_data = truelayer_api.get_account_balance(access_token, account_id)
+            account["balance"] = balance_data
+            transactions = truelayer_api.get_account_transactions(access_token, account_id)
+
+        current_val = balance_data.get('current', 0.0)
+        total_balance += current_val
+
+        if current_val >= 0:
+            total_assets += current_val
+        else:
+            total_liabilities += abs(current_val)
+
+        # Calculate today's change by summing today's transactions
+        for tx in transactions:
+            if tx['timestamp'].startswith(today_str):
+                todays_change += tx['amount']
 
     credit_cards = [acc for acc in all_accounts if acc['account_type'] == 'CARD']
     savings_accounts = [acc for acc in all_accounts if acc['account_type'] == 'SAVING']
     debit_accounts = [acc for acc in all_accounts if acc['account_type'] == 'TRANSACTION']
 
     return jsonify({
+        "summary": {
+            "net_worth": round(total_balance, 2),
+            "total_assets": round(total_assets, 2),
+            "total_liabilities": round(total_liabilities, 2),
+            "todays_change": round(todays_change, 2),
+            "currency": "GBP" # Assuming GBP for simplicity, ideally taken from first account
+        },
         "credit_cards": credit_cards,
         "savings_accounts": savings_accounts,
         "debit_accounts": debit_accounts
@@ -107,24 +142,117 @@ def get_breakdown_data(access_token):
     for card in cards:
         all_transactions.extend(truelayer_api.get_card_transactions(access_token, card["account_id"]))
 
-    current_month_str = datetime.now().strftime('%Y-%m')
+    # Check if a specific month is requested (YYYY-MM)
+    selected_month = request.args.get('month')
+    if selected_month:
+        target_month_str = selected_month
+        # Parse for display name
+        try:
+            month_display = datetime.strptime(selected_month, '%Y-%m').strftime('%B %Y')
+        except ValueError:
+            month_display = selected_month
+    else:
+        target_month_str = datetime.now().strftime('%Y-%m')
+        month_display = datetime.now().strftime('%B %Y')
+
     spending_by_category = defaultdict(float)
 
     for tx in all_transactions:
         tx_month = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m')
-        if tx_month == current_month_str and tx['amount'] < 0:
+        if tx_month == target_month_str and tx['amount'] < 0:
             spending_by_category[tx['transaction_category']] += abs(tx['amount'])
 
     sorted_spending = sorted(spending_by_category.items(), key=lambda item: item[1], reverse=True)
 
     labels = [item[0] for item in sorted_spending]
     data = [round(item[1], 2) for item in sorted_spending]
-    month_display = datetime.now().strftime('%B %Y')
 
     return jsonify({
         "labels": labels,
         "data": data,
         "month": month_display
+    })
+
+@app.route('/api/account_transactions')
+@token_required
+def get_single_account_transactions(access_token):
+    """Fetches recent transactions for a single account."""
+    account_id = request.args.get('account_id')
+    account_type = request.args.get('account_type')
+
+    if not account_id:
+        return jsonify({"error": "account_id is required"}), 400
+
+    transactions = []
+    if account_type == 'CARD':
+        transactions = truelayer_api.get_card_transactions(access_token, account_id)
+    else:
+        transactions = truelayer_api.get_account_transactions(access_token, account_id)
+
+    # Sort by date descending (newest first)
+    transactions.sort(key=lambda x: x['timestamp'], reverse=True)
+    
+    # Return up to 15 recent transactions for the detail view
+    return jsonify(transactions[:15])
+
+
+@app.route('/api/transactions')
+@token_required
+def get_transactions_data(access_token):
+    """
+    Fetches all transactions from all accounts and returns them as a sorted list.
+    """
+    accounts = truelayer_api.get_accounts(access_token)
+    cards = truelayer_api.get_cards(access_token)
+
+    all_transactions = []
+
+    # Fetch transactions and append account name for context
+    for account in accounts:
+        txs = truelayer_api.get_account_transactions(access_token, account["account_id"])
+        for tx in txs:
+            tx['account_name'] = account['display_name']
+            all_transactions.append(tx)
+
+    for card in cards:
+        txs = truelayer_api.get_card_transactions(access_token, card["account_id"])
+        for tx in txs:
+            tx['account_name'] = card['display_name']
+            all_transactions.append(tx)
+
+    # Sort by date descending (newest first)
+    all_transactions.sort(key=lambda x: x['timestamp'], reverse=True)
+
+    # --- Search Logic ---
+    search_query = request.args.get('search', '').lower()
+    if search_query:
+        filtered_txs = []
+        for tx in all_transactions:
+            # Check description or amount (converted to string)
+            if search_query in tx.get('description', '').lower() or search_query in str(tx.get('amount', '')):
+                filtered_txs.append(tx)
+        all_transactions = filtered_txs
+
+    # --- Pagination Logic ---
+    page = request.args.get('page', 1, type=int)
+    per_page = 50  # Number of transactions per page
+    total_txs = len(all_transactions)
+    total_pages = math.ceil(total_txs / per_page)
+
+    start = (page - 1) * per_page
+    end = start + per_page
+    paginated_txs = all_transactions[start:end]
+
+    return jsonify({
+        "transactions": paginated_txs,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_pages": total_pages,
+            "total_transactions": total_txs,
+            "has_prev": page > 1,
+            "has_next": page < total_pages
+        }
     })
 
 
