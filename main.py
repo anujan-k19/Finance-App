@@ -83,6 +83,7 @@ def get_dashboard_data(access_token):
     todays_change = 0.0
     today_str = datetime.now().strftime('%Y-%m-%d')
 
+    # Iterate through each account to fetch its balance and calculate totals.
     for account in all_accounts:
         account_id = account["account_id"]
         balance = 0.0
@@ -97,6 +98,7 @@ def get_dashboard_data(access_token):
             account["balance"] = balance_data
             transactions = truelayer_api.get_account_transactions(access_token, account_id)
 
+        # Aggregate balances for summary calculations.
         current_val = balance_data.get('current', 0.0)
         total_balance += current_val
 
@@ -105,6 +107,7 @@ def get_dashboard_data(access_token):
         else:
             total_liabilities += abs(current_val)
 
+        # Calculate today's change by summing the amounts of today's transactions.
         # Calculate today's change by summing today's transactions
         for tx in transactions:
             if tx['timestamp'].startswith(today_str):
@@ -114,6 +117,7 @@ def get_dashboard_data(access_token):
     savings_accounts = [acc for acc in all_accounts if acc['account_type'] == 'SAVING']
     debit_accounts = [acc for acc in all_accounts if acc['account_type'] == 'TRANSACTION']
 
+    # Return all data structured for the frontend.
     return jsonify({
         "summary": {
             "net_worth": round(total_balance, 2),
@@ -136,6 +140,7 @@ def get_breakdown_data(access_token):
     accounts = truelayer_api.get_accounts(access_token)
     cards = truelayer_api.get_cards(access_token)
 
+    # Aggregate transactions from all accounts and cards.
     all_transactions = []
     for account in accounts:
         all_transactions.extend(truelayer_api.get_account_transactions(access_token, account["account_id"]))
@@ -155,11 +160,13 @@ def get_breakdown_data(access_token):
         target_month_str = datetime.now().strftime('%Y-%m')
         month_display = datetime.now().strftime('%B %Y')
 
+    # Calculate total spending for each category in the target month.
     spending_by_category = defaultdict(float)
 
     for tx in all_transactions:
         tx_month = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m')
         if tx_month == target_month_str and tx['amount'] < 0:
+            # Only sum negative amounts (spending) and use absolute value for the chart.
             spending_by_category[tx['transaction_category']] += abs(tx['amount'])
 
     sorted_spending = sorted(spending_by_category.items(), key=lambda item: item[1], reverse=True)
@@ -180,6 +187,7 @@ def get_single_account_transactions(access_token):
     account_id = request.args.get('account_id')
     account_type = request.args.get('account_type')
 
+    # Ensure required parameters are provided.
     if not account_id:
         return jsonify({"error": "account_id is required"}), 400
 
@@ -191,7 +199,7 @@ def get_single_account_transactions(access_token):
 
     # Sort by date descending (newest first)
     transactions.sort(key=lambda x: x['timestamp'], reverse=True)
-    
+    # Return only the top 15 most recent transactions for the detail view.
     # Return up to 15 recent transactions for the detail view
     return jsonify(transactions[:15])
 
@@ -205,6 +213,7 @@ def get_transactions_data(access_token):
     accounts = truelayer_api.get_accounts(access_token)
     cards = truelayer_api.get_cards(access_token)
 
+    # Aggregate transactions from all accounts, adding the account name for context.
     all_transactions = []
 
     # Fetch transactions and append account name for context
@@ -223,6 +232,7 @@ def get_transactions_data(access_token):
     # Sort by date descending (newest first)
     all_transactions.sort(key=lambda x: x['timestamp'], reverse=True)
 
+    # If a search query is provided, filter transactions by description or amount.
     # --- Search Logic ---
     search_query = request.args.get('search', '').lower()
     if search_query:
@@ -233,6 +243,7 @@ def get_transactions_data(access_token):
                 filtered_txs.append(tx)
         all_transactions = filtered_txs
 
+    # Paginate the final list of transactions.
     # --- Pagination Logic ---
     page = request.args.get('page', 1, type=int)
     per_page = 50  # Number of transactions per page

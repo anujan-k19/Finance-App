@@ -1,4 +1,8 @@
-// A component to display a single account
+/**
+ * A presentational component for a single account card.
+ * @param {{account: object, onClick: function, isSelected: boolean}} props
+ * @returns {JSX.Element}
+ */
 function Account({ account, onClick, isSelected }) {
     const cardClass = `account ${isSelected ? 'selected' : ''}`;
     return (
@@ -16,7 +20,11 @@ function Account({ account, onClick, isSelected }) {
     );
 }
 
-// A card to display a high-level summary stat
+/**
+ * A presentational component for a summary card on the dashboard.
+ * @param {{title: string, value: number, currency: string, isChange: boolean}} props
+ * @returns {JSX.Element}
+ */
 function SummaryCard({ title, value, currency, isChange }) {
     const numericValue = parseFloat(value);
     const formattedValue = numericValue.toLocaleString('en-GB', { style: 'currency', currency: currency || 'GBP' });
@@ -34,7 +42,10 @@ function SummaryCard({ title, value, currency, isChange }) {
     );
 }
 
-// A reusable loading spinner component
+/**
+ * A simple, reusable loading spinner component.
+ * @returns {JSX.Element}
+ */
 function LoadingSpinner() {
     return (
         <div className="spinner-container">
@@ -43,7 +54,11 @@ function LoadingSpinner() {
     );
 }
 
-// Component to display a section of accounts
+/**
+ * A container component that displays a grid of account cards for a specific section.
+ * @param {{title: string, accounts: Array<object>, onAccountSelect: function, selectedAccountId: string}} props
+ * @returns {JSX.Element}
+ */
 function AccountSection({ title, accounts, onAccountSelect, selectedAccountId }) {
     return (
         <div className="account-section">
@@ -66,6 +81,11 @@ function AccountSection({ title, accounts, onAccountSelect, selectedAccountId })
     );
 }
 
+/**
+ * A component that fetches and displays a list of recent transactions for a selected account.
+ * @param {{account: object, onClose: function}} props
+ * @returns {JSX.Element}
+ */
 function TransactionList({ account, onClose }) {
     const { data: transactions, loading, error } = useFetch(`/api/account_transactions?account_id=${account.account_id}&account_type=${account.account_type}`);
 
@@ -105,6 +125,10 @@ function TransactionList({ account, onClose }) {
     );
 }
 
+/**
+ * The main layout component for the application. Includes the responsive navbar.
+ * @returns {JSX.Element}
+ */
 function Layout() {
     const { useState } = React;
     const { Link, Outlet } = ReactRouterDOM;
@@ -138,6 +162,11 @@ function Layout() {
     );
 }
 
+/**
+ * A wrapper component for Chart.js to render the spending breakdown doughnut chart.
+ * @param {{data: object}} props
+ * @returns {JSX.Element}
+ */
 function SpendingChart({ data }) {
     const { useRef, useEffect } = React;
     const chartRef = useRef(null);
@@ -191,6 +220,10 @@ function SpendingChart({ data }) {
     );
 }
 
+/**
+ * A React class component that catches JavaScript errors in its child component tree,
+ * logs those errors, and displays a fallback UI.
+ */
 class ErrorBoundary extends React.Component {
     constructor(props) {
         super(props);

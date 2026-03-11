@@ -1,8 +1,13 @@
+/**
+ * The main dashboard page component.
+ * Fetches and displays the financial overview, summary cards, and account sections.
+ */
 function Dashboard() {
     const { useState } = React;
     const { data, loading, error, refetch } = useFetch('/api/dashboard');
     const [selectedAccount, setSelectedAccount] = useState(null);
 
+    // Handles the click event on an account card to show/hide the transaction detail view.
     const handleAccountSelect = (account) => {
         // If clicking the same account, deselect it. Otherwise, select the new one.
         if (selectedAccount && selectedAccount.account_id === account.account_id) {
@@ -78,6 +83,10 @@ function Dashboard() {
     );
 }
 
+/**
+ * The spending breakdown page component.
+ * Fetches and displays spending data in a chart, allowing users to filter by month.
+ */
 function Breakdown() {
     const { useState } = React;
     // Default to current month YYYY-MM
@@ -129,6 +138,10 @@ function Breakdown() {
     );
 }
 
+/**
+ * The transactions page component.
+ * Fetches and displays a paginated and searchable list of all transactions.
+ */
 function Transactions() {
     const { useState } = React;
     const [page, setPage] = useState(1);

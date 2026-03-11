@@ -1,4 +1,9 @@
-// Custom hook for fetching data
+/**
+ * A custom React hook for fetching data from a URL.
+ * It handles loading, error, and data states, and provides a refetch function.
+ * @param {string} url - The URL to fetch data from.
+ * @returns {{data: any, loading: boolean, error: Error|null, refetch: function}}
+ */
 function useFetch(url) {
     const { useState, useEffect } = React;
     const [data, setData] = useState(null);
@@ -6,11 +11,13 @@ function useFetch(url) {
     const [error, setError] = useState(null);
     const [trigger, setTrigger] = useState(0);
 
+    // Function to manually trigger a refetch of the data.
     const refetch = () => {
         setTrigger(t => t + 1);
     };
 
     useEffect(() => {
+        // This effect runs whenever the URL or the refetch trigger changes.
         const fetchData = async () => {
             setLoading(true);
             try {
@@ -32,7 +39,7 @@ function useFetch(url) {
             }
         };
         fetchData();
-    }, [url, trigger]);
+    }, [url, trigger]); // Dependency array includes trigger to allow refetching.
 
     return { data, loading, error, refetch };
 }

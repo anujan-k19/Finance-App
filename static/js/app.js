@@ -1,4 +1,7 @@
-// The main App component
+/**
+ * The root component of the React application.
+ * It sets up the client-side router.
+ */
 function App() {
     const { BrowserRouter, Routes, Route } = ReactRouterDOM;
     return (
@@ -14,5 +17,6 @@ function App() {
     );
 }
 
+// Mount the React application to the DOM.
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(<App />);
