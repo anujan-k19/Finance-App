@@ -5,6 +5,7 @@ from itertools import groupby
 from functools import wraps
 import math
 from collections import defaultdict
+import calendar
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, session, url_for, jsonify
 import requests 
@@ -45,15 +46,26 @@ MERCHANT_TO_CATEGORY = {
 # Add some common categories that might not be in the rules.
 ADDITIONAL_CATEGORIES = ["General", "Income", "Transfers", "Entertainment", "Health"]
 
-def categorize_transaction(description):
-    """Categorizes a transaction based on keywords in its description."""
+def categorize_transaction(description, session):
+    """
+    Categorizes a transaction based on keywords in its description,
+    respecting user-defined rule overrides.
+    """
     if not description:
         return "General"
     description_lower = description.lower()
+
+    # 1. Check for user-defined rule overrides first
+    rule_overrides = session.get('rule_overrides', {})
+    for merchant, category in rule_overrides.items():
+        if merchant in description_lower:
+            return category
+
+    # 2. Check hardcoded rules next
     for merchant, category in MERCHANT_TO_CATEGORY.items():
         if merchant in description_lower:
             return category
-    return "General"  # Default category if no match is found
+    return "General"  # 3. Default category if no match is found
 
 def token_required(f):
     """Decorator to check for access token and handle token refresh."""
@@ -206,22 +218,81 @@ def get_breakdown_data(access_token):
         tx_month = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m')
         if tx_month == target_month_str and tx['amount'] < 0:
             tx_id = tx.get('transaction_id')
-            # Use our custom categorization logic for grouping
-            if tx_id and tx_id in overrides:
-                category = overrides[tx_id]
-            else:
-                category = categorize_transaction(tx.get('description'))
+            category = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
             spending_by_category[category] += abs(tx['amount'])
 
-    sorted_spending = sorted(spending_by_category.items(), key=lambda item: item[1], reverse=True)
+    # Get budget data from session
+    budgets = session.get('budgets', {})
 
-    labels = [item[0] for item in sorted_spending]
-    data = [round(item[1], 2) for item in sorted_spending]
+    # Combine spending with budget data for a detailed breakdown
+    # Only show categories for which a budget has been defined.
+    breakdown_details = []
+    for category in sorted(list(budgets.keys())):
+        spent = spending_by_category.get(category, 0)
+        budget = float(budgets.get(category, 0))
+        if budget > 0:
+            remaining = budget - spent
+            breakdown_details.append({
+                "category": category,
+                "spent": round(spent, 2),
+                "budget": round(budget, 2),
+                "remaining": round(remaining, 2)
+            })
+
+    # Chart data should only include categories with actual spending
+    sorted_spending = sorted(spending_by_category.items(), key=lambda item: item[1], reverse=True)
+    chart_labels = [item[0] for item in sorted_spending]
+    chart_data = [round(item[1], 2) for item in sorted_spending]
+
+    return jsonify({
+        "labels": chart_labels,
+        "data": chart_data,
+        "month": month_display,
+        "details": breakdown_details
+        })
+
+@app.route('/api/spending_over_time')
+@token_required
+def get_spending_over_time(access_token):
+    """
+    Provides daily spending totals for a given month to power line charts.
+    """
+    accounts = truelayer_api.get_accounts(access_token)
+    cards = truelayer_api.get_cards(access_token)
+
+    all_transactions = []
+    for account in accounts:
+        all_transactions.extend(truelayer_api.get_account_transactions(access_token, account["account_id"]))
+    for card in cards:
+        all_transactions.extend(truelayer_api.get_card_transactions(access_token, card["account_id"]))
+
+    selected_month = request.args.get('month')
+    if not selected_month:
+        return jsonify({"error": "month parameter is required"}), 400
+
+    # Filter transactions for the selected month
+    month_transactions = [tx for tx in all_transactions if tx['timestamp'].startswith(selected_month)]
+
+    daily_spending = defaultdict(float)
+    for tx in month_transactions:
+        if tx['amount'] < 0:
+            day = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).day
+            daily_spending[day] += abs(tx['amount'])
+
+    # Get the number of days in the selected month
+    try:
+        year, month_num = map(int, selected_month.split('-'))
+        num_days = calendar.monthrange(year, month_num)[1]
+    except ValueError:
+        return jsonify({"error": "Invalid month format. Use YYYY-MM."}), 400
+    
+    labels = [f"Day {day}" for day in range(1, num_days + 1)]
+    data = [round(sum(daily_spending.get(d, 0) for d in range(1, day + 1)), 2) for day in range(1, num_days + 1)]
 
     return jsonify({
         "labels": labels,
         "data": data,
-        "month": month_display
+        "label": "Daily Spending"
     })
 
 @app.route('/api/account_transactions')
@@ -245,10 +316,7 @@ def get_single_account_transactions(access_token):
     # Add our custom category to each transaction
     for tx in transactions:
         tx_id = tx.get('transaction_id')
-        if tx_id and tx_id in overrides:
-            tx['display_category'] = overrides[tx_id]
-        else:
-            tx['display_category'] = categorize_transaction(tx.get('description'))
+        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
 
     # Sort by date descending (newest first)
     transactions.sort(key=lambda x: x['timestamp'], reverse=True)
@@ -276,11 +344,7 @@ def get_transactions_data(access_token):
         for tx in txs:
             tx['account_name'] = account['display_name']
             tx_id = tx.get('transaction_id')
-            # Add our custom category
-            if tx_id and tx_id in overrides:
-                tx['display_category'] = overrides[tx_id]
-            else:
-                tx['display_category'] = categorize_transaction(tx.get('description'))
+            tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
             all_transactions.append(tx)
 
     for card in cards:
@@ -288,11 +352,7 @@ def get_transactions_data(access_token):
         for tx in txs:
             tx['account_name'] = card['display_name']
             tx_id = tx.get('transaction_id')
-            # Add our custom category
-            if tx_id and tx_id in overrides:
-                tx['display_category'] = overrides[tx_id]
-            else:
-                tx['display_category'] = categorize_transaction(tx.get('description'))
+            tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
             all_transactions.append(tx)
 
     # Sort by date descending (newest first)
@@ -308,7 +368,7 @@ def get_transactions_data(access_token):
     # Allows fetching transactions for a specific category, used by the breakdown drill-down.
     category_filter = request.args.get('category')
     if category_filter:
-        all_transactions = [tx for tx in all_transactions if tx.get('display_category') == category_filter]
+        all_transactions = [tx for tx in all_transactions if tx.get('display_category') == category_filter and tx['amount'] < 0]
 
     # If a search query is provided, filter transactions by description or amount.
     # --- Search Logic ---
@@ -375,6 +435,53 @@ def set_transaction_category(access_token):
     session.modified = True  # Explicitly mark session as modified
     
     return jsonify({"success": True, "transaction_id": transaction_id, "category": category})
+
+@app.route('/api/categorize_rule', methods=['POST'])
+@token_required
+def set_categorization_rule(access_token):
+    """Creates a new rule to categorize all transactions from a vendor."""
+    data = request.get_json()
+    description = data.get('description')
+    category = data.get('category')
+
+    if not description or not category:
+        return jsonify({"error": "description and category are required"}), 400
+
+    # Find the merchant keyword from the description
+    description_lower = description.lower()
+    found_merchant = None
+    for merchant in MERCHANT_TO_CATEGORY.keys():
+        if merchant in description_lower:
+            found_merchant = merchant
+            break
+    
+    if not found_merchant:
+        return jsonify({"error": f"Could not determine a merchant rule for '{description}'"}), 400
+
+    if 'rule_overrides' not in session:
+        session['rule_overrides'] = {}
+    
+    session['rule_overrides'][found_merchant] = category
+    session.modified = True
+
+    return jsonify({"success": True, "rule": {found_merchant: category}})
+
+@app.route('/api/budgets', methods=['GET', 'POST'])
+@token_required
+def handle_budgets(access_token):
+    """Handles getting and setting monthly budgets per category."""
+    if request.method == 'POST':
+        # Sanitize and save the budgets posted by the user
+        raw_budgets = request.get_json()
+        budgets = {k: float(v) for k, v in raw_budgets.items() if v}
+        
+        session['budgets'] = budgets
+        session.modified = True
+        return jsonify({"success": True, "budgets": budgets})
+
+    # For a GET request, simply return the currently stored budgets
+    budgets = session.get('budgets', {})
+    return jsonify(budgets)
 
 
 @app.route('/connect')

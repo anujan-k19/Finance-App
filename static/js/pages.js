@@ -116,9 +116,16 @@ function Breakdown() {
     // Default to current month YYYY-MM
     const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
     const [selectedCategory, setSelectedCategory] = useState(null);
+    const [chartType, setChartType] = useState('category'); // 'category' or 'time'
     const transactionListRef = useRef(null); // Ref for the transaction list
     const chartContainerRef = useRef(null); // Ref for the chart container to scroll back to
-    const { data: chartData, loading, error } = useFetch(`/api/breakdown?month=${month}`);
+
+    // Conditionally fetch data based on the selected chart type
+    const { data: categoryData, loading: categoryLoading, error: categoryError } = useFetch(chartType === 'category' ? `/api/breakdown?month=${month}` : null);
+    const { data: timeData, loading: timeLoading, error: timeError } = useFetch(chartType === 'time' ? `/api/spending_over_time?month=${month}` : null);
+
+    const loading = categoryLoading || timeLoading;
+    const error = categoryError || timeError;
 
     // Effect to scroll to the transaction list when a category is selected
     useEffect(() => {
@@ -160,7 +167,7 @@ function Breakdown() {
         );
     }
 
-    if (error || !chartData) {
+    if (error) {
         return (
             <div>
                 <h1>My Finance Dashboard</h1>
@@ -186,9 +193,30 @@ function Breakdown() {
                 />
             </div>
 
-            <div ref={chartContainerRef}>
-                <h2>{chartData.month}</h2>
-                <SpendingChart data={chartData} onCategoryClick={handleCategoryClick} />
+            <div className="chart-type-selector">
+                <button onClick={() => setChartType('category')} className={`button-switch ${chartType === 'category' ? 'active' : ''}`}>By Category</button>
+                <button onClick={() => setChartType('time')} className={`button-switch ${chartType === 'time' ? 'active' : ''}`}>Over Time</button>
+            </div>
+
+            <div ref={chartContainerRef} className="chart-section">
+                {/* Use optional chaining (?.) to safely access month from categoryData */}
+                <h2>{categoryData?.month || new Date(month).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' })}</h2>
+                
+                {loading && <LoadingSpinner />}
+
+                {/* Logic for displaying the category doughnut chart */}
+                {!loading && chartType === 'category' && (
+                    categoryData?.data?.length > 0 ? (
+                        <SpendingChart data={categoryData} onCategoryClick={handleCategoryClick} />
+                    ) : <p style={{textAlign: 'center', padding: '2rem'}}>No spending data for this month.</p>
+                )}
+
+                {/* Logic for displaying the spending over time line chart */}
+                {!loading && chartType === 'time' && (
+                    timeData?.data?.length > 0 ? (
+                        <LineChart data={timeData} />
+                    ) : <p style={{textAlign: 'center', padding: '2rem'}}>No spending data for this month.</p>
+                )}
             </div>
 
             <div ref={transactionListRef}>
@@ -200,6 +228,31 @@ function Breakdown() {
                     />
                 )}
             </div>
+
+            {/* Only show budget breakdown when viewing by category */}
+            {chartType === 'category' && categoryData && categoryData.details && categoryData.details.length > 0 && (
+                <div className="budget-breakdown-table">
+                    <h3>Budget vs. Actual Spending</h3>
+                    {categoryData.details.map(item => (
+                        <div key={item.category} className="budget-row">
+                            <div className="budget-info">
+                                <span className="budget-category">{item.category}</span>
+                                <span className="budget-values">
+                                    {item.spent.toLocaleString('en-GB', {style: 'currency', currency: 'GBP'})} / {item.budget > 0 ? item.budget.toLocaleString('en-GB', {style: 'currency', currency: 'GBP'}) : 'No Budget'}
+                                </span>
+                            </div>
+                            {item.budget > 0 && (
+                                <div className="progress-bar-container">
+                                    <div 
+                                        className={`progress-bar ${item.spent > item.budget ? 'over-budget' : ''}`}
+                                        style={{ width: `${Math.min((item.spent / item.budget) * 100, 100)}%` }}
+                                    ></div>
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
         </div>
     );
 }
@@ -212,6 +265,7 @@ function Transactions() {
     const { useState } = React;
     const [page, setPage] = useState(1);
     const [searchTerm, setSearchTerm] = useState('');
+    const [selectedTransaction, setSelectedTransaction] = useState(null);
     
     // Reset to page 1 when search changes
     const handleSearch = (e) => {
@@ -222,24 +276,45 @@ function Transactions() {
     const { data, loading, error, refetch } = useFetch(`/api/transactions?page=${page}&search=${encodeURIComponent(searchTerm)}`);
     const { data: categories } = useFetch('/api/categories');
 
-    const handleCategoryChange = async (transactionId, newCategory) => {
+    /**
+     * Handles saving a category change for a single transaction or for all similar transactions.
+     * @param {object} transaction - The transaction object being updated.
+     * @param {string} newCategory - The new category to apply.
+     * @param {string} scope - The scope of the update ('one' or 'all').
+     */
+    const handleSaveCategory = async (transaction, newCategory, scope) => {
+        let url = '/api/categorize';
+        let body = {
+            transaction_id: transaction.transaction_id,
+            category: newCategory,
+        };
+
+        // If the user chose to update all similar transactions, use the rule-based endpoint.
+        if (scope === 'all') {
+            url = '/api/categorize_rule';
+            body = {
+                description: transaction.description,
+                category: newCategory,
+            };
+        }
+
         try {
-            const response = await fetch('/api/categorize', {
+            const response = await fetch(url, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({
-                    transaction_id: transactionId,
-                    category: newCategory,
-                }),
+                body: JSON.stringify(body),
             });
             if (!response.ok) {
                 throw new Error('Failed to update category');
             }
-            refetch(); // Refetch transactions to show the update
+            // After a successful save, call refetch() to get the updated list of transactions
+            // from the server. This ensures the UI updates instantly with the new categories.
+            refetch();
         } catch (err) {
             console.error("Category update failed:", err);
+            // Optionally, show an error message to the user
         }
     };
 
@@ -293,8 +368,7 @@ function Transactions() {
                             <TransactionRow 
                                 key={tx.transaction_id} 
                                 transaction={tx} 
-                                categories={categories || []}
-                                onCategoryChange={handleCategoryChange}
+                                onClick={() => setSelectedTransaction(tx)}
                                 showAccountName={true}
                             />
                         );
@@ -313,6 +387,94 @@ function Transactions() {
                 <button onClick={() => setPage(page + 1)} disabled={!pagination.has_next}>
                     Next &rarr;
                 </button>
+            </div>
+
+            {selectedTransaction && (
+                <TransactionDetailModal 
+                    transaction={selectedTransaction}
+                    categories={categories || []}
+                    onClose={() => setSelectedTransaction(null)}
+                    onSave={handleSaveCategory}
+                />
+            )}
+        </div>
+    );
+}
+
+/**
+ * The Budgets page component.
+ * Allows users to set monthly spending limits for various categories.
+ */
+function Budgets() {
+    const { useState, useEffect } = React;
+    const { data: categories, loading: categoriesLoading } = useFetch('/api/categories');
+    const { data: initialBudgets, loading: budgetsLoading } = useFetch('/api/budgets');
+    const [budgets, setBudgets] = useState({});
+    const [isSaving, setIsSaving] = useState(false);
+    const [saveSuccess, setSaveSuccess] = useState(false);
+
+    // Pre-fill the form with previously saved budgets
+    useEffect(() => {
+        if (initialBudgets) {
+            setBudgets(initialBudgets);
+        }
+    }, [initialBudgets]);
+
+    const handleInputChange = (category, value) => {
+        setBudgets(prev => ({
+            ...prev,
+            [category]: value
+        }));
+    };
+
+    const handleSave = async () => {
+        setIsSaving(true);
+        setSaveSuccess(false);
+        try {
+            const response = await fetch('/api/budgets', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(budgets)
+            });
+            if (!response.ok) throw new Error('Failed to save budgets');
+            setSaveSuccess(true);
+            setTimeout(() => setSaveSuccess(false), 2000); // Hide message after 2s
+        } catch (err) {
+            console.error(err);
+            // Optionally, show an error message to the user
+        } finally {
+            setIsSaving(false);
+        }
+    };
+
+    if (categoriesLoading || budgetsLoading) {
+        return <div><h1>Budgets</h1><LoadingSpinner /></div>;
+    }
+
+    return (
+        <div>
+            <h1>Set Monthly Budgets</h1>
+            <p>Set a spending limit for each category. This will apply to every month.</p>
+            <div className="budget-list">
+                {(categories || []).map(category => (
+                    <div key={category} className="budget-item">
+                        <label htmlFor={`budget-${category}`}>{category}</label>
+                        <input
+                            id={`budget-${category}`}
+                            type="number"
+                            value={budgets[category] || ''}
+                            onChange={(e) => handleInputChange(category, e.target.value)}
+                            placeholder="0.00"
+                            className="budget-input"
+                        />
+                    </div>
+                ))}
+            </div>
+            <div className="budget-save-container">
+                <button onClick={handleSave} disabled={isSaving} className="button">
+                    {isSaving ? 'Saving...' : 'Save Budgets'}
+                </button>
+                {saveSuccess && <span className="save-success-message">Budgets saved!</span>}
             </div>
         </div>
     );

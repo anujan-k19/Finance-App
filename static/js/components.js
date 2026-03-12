@@ -21,7 +21,7 @@ function Account({ account, onClick, isSelected }) {
 }
 
 /**
- * A presentational component for a summary card on the dashboard.
+ * A card for displaying a high-level summary statistic.
  * @param {{title: string, value: number, currency: string, isChange: boolean}} props
  * @returns {JSX.Element}
  */
@@ -43,7 +43,7 @@ function SummaryCard({ title, value, currency, isChange }) {
 }
 
 /**
- * A simple, reusable loading spinner component.
+ * A reusable loading spinner component.
  * @returns {JSX.Element}
  */
 function LoadingSpinner() {
@@ -55,8 +55,8 @@ function LoadingSpinner() {
 }
 
 /**
- * A container component that displays a grid of account cards for a specific section.
- * @param {{title: string, accounts: Array<object>, onAccountSelect: function, selectedAccountId: string}} props
+ * A container component that displays a grid of account cards under a title.
+ * @param {{title: string, accounts: Array<object>, onAccountSelect: function, selectedAccountId: string|null}} props
  * @returns {JSX.Element}
  */
 function AccountSection({ title, accounts, onAccountSelect, selectedAccountId }) {
@@ -86,34 +86,11 @@ function AccountSection({ title, accounts, onAccountSelect, selectedAccountId })
  * @param {{transaction: object, categories: Array<string>, onCategoryChange: function, showAccountName: boolean}} props
  * @returns {JSX.Element}
  */
-function TransactionRow({ transaction, categories, onCategoryChange, showAccountName = false }) {
-    const { useState } = React;
-    const [currentCategory, setCurrentCategory] = useState(transaction.display_category);
-    const [isSaving, setIsSaving] = useState(false);
-
-    const handleSelectChange = async (e) => {
-        const newCategory = e.target.value;
-        setCurrentCategory(newCategory);
-        setIsSaving(true);
-        await onCategoryChange(transaction.transaction_id, newCategory);
-        setIsSaving(false);
-    };
-
+function TransactionRow({ transaction, onClick, showAccountName = false }) {
     return (
-        <tr>
+        <tr onClick={onClick} className="clickable-row">
             <td>{transaction.description}</td>
-            <td>
-                <select 
-                    value={currentCategory} 
-                    onChange={handleSelectChange} 
-                    disabled={isSaving || !transaction.transaction_id}
-                    className="category-select"
-                    title={!transaction.transaction_id ? "Categorization unavailable" : "Change category"}
-                >
-                    { !categories.includes(currentCategory) && <option key={currentCategory} value={currentCategory}>{currentCategory}</option> }
-                    {categories.map(cat => (<option key={cat} value={cat}>{cat}</option>))}
-                </select>
-            </td>
+            <td>{transaction.display_category}</td>
             {showAccountName && <td>{transaction.account_name}</td>}
             <td style={{ textAlign: 'right', fontWeight: transaction.amount > 0 ? 'bold' : 'normal', color: transaction.amount > 0 ? '#28a745' : 'inherit' }}>
                 {transaction.amount.toLocaleString('en-GB', { style: 'currency', currency: transaction.currency || 'GBP' })}
@@ -133,10 +110,6 @@ function TransactionList({ account, onClose }) {
     const { data: categories } = useFetch('/api/categories');
     const [isClosing, setIsClosing] = useState(false);
 
-    /**
-     * Handles the closing of the detail view, triggering a collapse animation
-     * before calling the parent's onClose handler.
-     */
     const handleClose = () => {
         setIsClosing(true);
         setTimeout(() => onClose(), 300); // Duration should match CSS transition
@@ -224,10 +197,6 @@ function CategoryTransactionList({ category, month, onClose }) {
 
     const transactions = data?.transactions || [];
 
-    /**
-     * Handles the closing of the detail view, triggering a collapse animation
-     * before calling the parent's onClose handler.
-     */
     const handleClose = () => {
         setIsClosing(true);
         setTimeout(() => onClose(), 300); // Duration should match CSS transition
@@ -274,11 +243,90 @@ function CategoryTransactionList({ category, month, onClose }) {
                             );
                             return acc;
                         }, []) : (
-                            <tr><td colSpan="3" style={{textAlign: 'center', padding: '1rem'}}>No transactions found for this category in the selected month.</td></tr>
+                            <tr><td colSpan="3" style={{textAlign: 'center', padding: '1rem'}}>No spending transactions found for this category.</td></tr>
                         )}
                     </tbody>
                 </table>
             )}
+        </div>
+    );
+}
+
+/**
+ * A modal component to display transaction details and allow categorization.
+ * @param {{transaction: object, categories: Array<string>, onClose: function, onSave: function}} props
+ */
+function TransactionDetailModal({ transaction, categories, onClose, onSave }) {
+    const { useState, useEffect } = React;
+    const [currentCategory, setCurrentCategory] = useState(transaction.display_category);
+    const [showConfirm, setShowConfirm] = useState(false);
+    const [isSaving, setIsSaving] = useState(false);
+
+    // Reset state if the transaction prop changes
+    useEffect(() => {
+        setCurrentCategory(transaction.display_category);
+        setShowConfirm(false);
+        setIsSaving(false);
+    }, [transaction]);
+
+    const handleCategorySelect = (e) => {
+        const newCategory = e.target.value;
+        setCurrentCategory(newCategory);
+        // Show confirmation if the category has actually changed
+        if (newCategory !== transaction.display_category) {
+            setShowConfirm(true);
+        } else {
+            setShowConfirm(false);
+        }
+    };
+
+    const handleSave = async (scope) => {
+        setIsSaving(true);
+        await onSave(transaction, currentCategory, scope);
+        setIsSaving(false);
+        onClose();
+    };
+
+    return (
+        <div className="modal-overlay" onClick={onClose}>
+            <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+                <div className="modal-header">
+                    <h3>Transaction Details</h3>
+                    <button onClick={onClose} className="close-button">&times;</button>
+                </div>
+                <div className="modal-body">
+                    <p><strong>Description:</strong> {transaction.description}</p>
+                    <p><strong>Amount:</strong> {transaction.amount.toLocaleString('en-GB', { style: 'currency', currency: transaction.currency || 'GBP' })}</p>
+                    <p><strong>Date:</strong> {new Date(transaction.timestamp).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p>
+                    <p><strong>Account:</strong> {transaction.account_name}</p>
+                    <div className="category-editor">
+                        <label htmlFor="category-modal-select">Category:</label>
+                        <select 
+                            id="category-modal-select"
+                            value={currentCategory} 
+                            onChange={handleCategorySelect} 
+                            disabled={isSaving || !transaction.transaction_id}
+                            className="category-select"
+                        >
+                            { !categories.includes(currentCategory) && <option key={currentCategory} value={currentCategory}>{currentCategory}</option> }
+                            {categories.map(cat => (<option key={cat} value={cat}>{cat}</option>))}
+                        </select>
+                    </div>
+                </div>
+                {showConfirm && (
+                    <div className="modal-footer">
+                        <p>Apply this category change to:</p>
+                        <div className="confirm-buttons">
+                            <button onClick={() => handleSave('one')} disabled={isSaving} className="button">
+                                {isSaving ? 'Saving...' : 'Just this one'}
+                            </button>
+                            <button onClick={() => handleSave('all')} disabled={isSaving} className="button secondary">
+                                {isSaving ? 'Saving...' : 'All similar'}
+                            </button>
+                        </div>
+                    </div>
+                )}
+            </div>
         </div>
     );
 }
@@ -308,6 +356,7 @@ function Layout() {
                     <ul className={`nav-links ${isMenuOpen ? 'active' : ''}`}>
                         <li><Link to="/" onClick={closeMenu}>Dashboard</Link></li>
                         <li><Link to="/transactions" onClick={closeMenu}>Transactions</Link></li>
+                        <li><Link to="/budgets" onClick={closeMenu}>Budgets</Link></li>
                         <li><Link to="/breakdown" onClick={closeMenu}>Spending Breakdown</Link></li>
                         <li><a href="/logout" onClick={closeMenu}>Logout</a></li>
                     </ul>
@@ -322,7 +371,7 @@ function Layout() {
 
 /**
  * A wrapper component for Chart.js to render the spending breakdown doughnut chart.
- * @param {{data: object}} props
+ * @param {{data: object, onCategoryClick: function}} props
  * @returns {JSX.Element}
  */
 function SpendingChart({ data, onCategoryClick }) {
@@ -389,8 +438,79 @@ function SpendingChart({ data, onCategoryClick }) {
 }
 
 /**
- * A React class component that catches JavaScript errors in its child component tree,
- * logs those errors, and displays a fallback UI.
+ * A wrapper component for Chart.js to render a line chart.
+ * @param {{data: object}} props
+ * @returns {JSX.Element}
+ */
+function LineChart({ data }) {
+    const { useRef, useEffect } = React;
+    const chartRef = useRef(null);
+    const chartInstance = useRef(null);
+    
+    useEffect(() => {
+        if (data && chartRef.current) {
+            if (chartInstance.current) {
+                chartInstance.current.destroy();
+            }
+            const ctx = chartRef.current.getContext('2d');
+            chartInstance.current = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: data.label || 'Data',
+                        data: data.data,
+                        fill: true,
+                        borderColor: 'rgb(75, 192, 192)',
+                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            display: false // Hide legend for a cleaner look
+                        },
+                        title: {
+                            display: true,
+                            text: 'Spending Over Time'
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true
+                        },
+                        x: {
+                            ticks: {
+                                // Label every 3 days
+                                callback: function(value, index, values) {
+                                    return index % 3 === 0 ? this.getLabelForValue(value) : '';
+                                },
+                                autoSkip: false // Prevents labels from being skipped if they don't fit
+                            }
+                        }                        
+                    }
+                }
+            });
+        }
+
+        return () => {
+            if (chartInstance.current) {
+                chartInstance.current.destroy();
+            }
+        };
+    }, [data]);
+
+    return (
+        <div className="chart-container">
+            <canvas ref={chartRef}></canvas>
+        </div>
+    );
+}
+
+/**
+ * A React Error Boundary component to gracefully handle rendering errors in its children.
  */
 class ErrorBoundary extends React.Component {
     constructor(props) {

@@ -18,6 +18,12 @@ function useFetch(url) {
 
     useEffect(() => {
         // This effect runs whenever the URL or the refetch trigger changes.
+        // Don't fetch if the URL is null or undefined.
+        if (!url) {
+            setLoading(false);
+            setData(null); // Ensure data is cleared
+            return;
+        }
         const fetchData = async () => {
             setLoading(true);
             try {

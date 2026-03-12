@@ -10,6 +10,7 @@ function App() {
                 <Route path="/" element={<Layout />}>
                     <Route index element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
                     <Route path="transactions" element={<ErrorBoundary><Transactions /></ErrorBoundary>} />
+                    <Route path="budgets" element={<ErrorBoundary><Budgets /></ErrorBoundary>} />
                     <Route path="breakdown" element={<ErrorBoundary><Breakdown /></ErrorBoundary>} />
                 </Route>
             </Routes>
