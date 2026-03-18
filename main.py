@@ -93,13 +93,15 @@ def login_required(f):
         return f(user, *args, **kwargs)
     return decorated_function
 
-def sync_truelayer_data(user_id, rule_overrides=None):
+def sync_truelayer_data(user_id):
     """
     Fetches data from all linked TrueLayer connections, persists to Supabase,
     and handles token refreshing.
     """
-    if rule_overrides is None:
-        rule_overrides = {}
+    # Fetch user-specific categorization rules from the database
+    rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user_id).execute()
+    rule_overrides = {rule['merchant_keyword']: rule['category'] for rule in rules_response.data}
+
     # 1. Get all bank connections for this user
     response = supabase.table('bank_connections').select("*").eq('user_id', user_id).execute()
     connections = response.data
@@ -226,8 +228,7 @@ def get_dashboard_data(user):
     user_id = user['id']
     
     # Optional: Trigger sync on load, or move this to a background worker / webhook
-    rule_overrides = session.get('rule_overrides', {}).copy()
-    threading.Thread(target=sync_truelayer_data, args=(user_id, rule_overrides)).start()
+    threading.Thread(target=sync_truelayer_data, args=(user_id,)).start()
 
     # Query Database
     db_accounts = supabase.table('accounts').select("*").eq('user_id', user_id).execute().data
@@ -330,13 +331,22 @@ def get_breakdown_data(user):
     transactions = response.data
 
     spending_by_category = defaultdict(float)
-    overrides = session.get('category_overrides', {})
+    # Fetch overrides and rules from DB instead of session
+    overrides_response = supabase.table('transaction_category_overrides').select('transaction_id, category').eq('user_id', user['id']).execute()
+    overrides = {item['transaction_id']: item['category'] for item in overrides_response.data}
+    
+    rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
+    rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
 
     for tx in transactions:
         amount = float(tx['amount'])
         if amount < 0:
             tx_id = tx['transaction_id']
-            category = overrides.get(tx_id, tx.get('category') or 'General')
+            # Determine category with correct precedence:
+            # 1. Manual override for this specific transaction ("Just this one")
+            # 2. Rule-based override for the merchant ("All similar")
+            # 3. Default rule-based categorization
+            category = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
             spending_by_category[category] += abs(amount)
 
     # Get budget data from session
@@ -451,8 +461,13 @@ def get_single_account_transactions(user):
     
     transactions = response.data
     
-    overrides = session.get('category_overrides', {})
-    rule_overrides = session.get('rule_overrides', {})
+    # Fetch overrides and rules from DB
+    overrides_response = supabase.table('transaction_category_overrides').select('transaction_id, category').eq('user_id', user['id']).execute()
+    overrides = {item['transaction_id']: item['category'] for item in overrides_response.data}
+    
+    rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
+    rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
+
     for tx in transactions:
         tx_id = tx.get('transaction_id')
         tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
@@ -474,13 +489,21 @@ def get_transactions_data(user):
     acc_response = supabase.table('accounts').select("account_id, display_name").eq('user_id', user['id']).execute()
     acc_map = {acc['account_id']: acc['display_name'] for acc in acc_response.data}
     
-    overrides = session.get('category_overrides', {})
+    # Fetch overrides and rules from DB
+    overrides_response = supabase.table('transaction_category_overrides').select('transaction_id, category').eq('user_id', user['id']).execute()
+    overrides = {item['transaction_id']: item['category'] for item in overrides_response.data}
+    
+    rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
+    rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
 
     for tx in all_transactions:
         tx['account_name'] = acc_map.get(tx['account_id'], 'Unknown Account')
         tx_id = tx['transaction_id']
-        # Use session override or DB category
-        tx['display_category'] = overrides.get(tx_id, tx.get('category') or 'General')
+        # Determine display category with correct precedence:
+        # 1. Manual override for this specific transaction ("Just this one")
+        # 2. Rule-based override for the merchant ("All similar")
+        # 3. Default rule-based categorization
+        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
 
     # --- Month Filter ---
     month_filter = request.args.get('month')
@@ -549,14 +572,17 @@ def set_transaction_category(user):
     if not transaction_id or not category:
         return jsonify({"error": "transaction_id and category are required"}), 400
 
-    # Initialize overrides dict in session if it doesn't exist
-    if 'category_overrides' not in session:
-        session['category_overrides'] = {}
-
-    session['category_overrides'][transaction_id] = category
-    session.modified = True  # Explicitly mark session as modified
-    
-    return jsonify({"success": True, "transaction_id": transaction_id, "category": category})
+    # Upsert the override into the database
+    try:
+        supabase.table('transaction_category_overrides').upsert({
+            'user_id': user['id'],
+            'transaction_id': transaction_id,
+            'category': category
+        }, on_conflict='user_id,transaction_id').execute()
+        
+        return jsonify({"success": True, "transaction_id": transaction_id, "category": category})
+    except Exception as e:
+        return jsonify({"error": "Failed to save override", "details": str(e)}), 500
 
 @app.route('/api/categorize_rule', methods=['POST'])
 @login_required
@@ -585,13 +611,16 @@ def set_categorization_rule(user):
         if words:
             found_merchant = words[0]
 
-    if 'rule_overrides' not in session:
-        session['rule_overrides'] = {}
-    
     if found_merchant:
-        session['rule_overrides'][found_merchant] = category
-        session.modified = True
-        return jsonify({"success": True, "rule": {found_merchant: category}})
+        try:
+            supabase.table('user_category_rules').upsert({
+                'user_id': user['id'],
+                'merchant_keyword': found_merchant,
+                'category': category
+            }, on_conflict='user_id,merchant_keyword').execute()
+            return jsonify({"success": True, "rule": {found_merchant: category}})
+        except Exception as e:
+            return jsonify({"error": "Failed to save rule", "details": str(e)}), 500
     else:
         return jsonify({"error": f"Could not determine a merchant rule for '{description}'"}), 400
 
@@ -677,8 +706,7 @@ def callback():
         }).execute()
         
         # Trigger immediate sync
-        rule_overrides = session.get('rule_overrides', {}).copy()
-        threading.Thread(target=sync_truelayer_data, args=(user['id'], rule_overrides)).start()
+        threading.Thread(target=sync_truelayer_data, args=(user['id'],)).start()
 
     return redirect(url_for("index"))
 
