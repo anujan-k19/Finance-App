@@ -4,10 +4,13 @@
  */
 function Dashboard() {
     const { useState, useRef, useEffect } = React;
+    const { hasConnections, checkSession } = useAuth();
     const { data, loading, error, refetch } = useFetch('/api/dashboard');
     const [selectedAccount, setSelectedAccount] = useState(null);
     const accountsContainerRef = useRef(null); // Ref for the top of the accounts sections
     const transactionListRef = useRef(null); // Ref for the transaction list container
+    const [showDisconnectModal, setShowDisconnectModal] = useState(false);
+    const [connectionToDelete, setConnectionToDelete] = useState(null);
 
     // Effect to scroll to the transaction list when an account is selected
     useEffect(() => {
@@ -37,6 +40,48 @@ function Dashboard() {
         }
     };
 
+    const confirmDisconnect = (connection) => {
+        setConnectionToDelete(connection);
+        setShowDisconnectModal(true);
+    };
+
+    const cancelDisconnect = () => {
+        setShowDisconnectModal(false);
+        setConnectionToDelete(null);
+    };
+
+    const handleDisconnect = async () => {
+        if (!connectionToDelete) return;
+
+        try {
+            const response = await fetch(`/api/connections/${connectionToDelete.id}`, { method: 'DELETE' });
+            if (response.ok) {
+                refetch(); // Reload the dashboard data
+                checkSession(); // Re-check session to update hasConnections state (resets page if last one deleted)
+            } else {
+                alert("Failed to disconnect the bank. Please try again.");
+            }
+        } catch (e) {
+            console.error("Delete failed", e);
+            alert("An error occurred while trying to disconnect the bank.");
+        } finally {
+            // Close modal whether success or fail
+            setShowDisconnectModal(false);
+            setConnectionToDelete(null);
+        }
+    };
+
+    // If the user has no connected accounts, force the "Connect" view immediately.
+    if (!hasConnections) {
+        return (
+            <div>
+                <h1>Welcome!</h1>
+                <p>Connect your first bank account to see your financial overview.</p>
+                <a href="/connect" className="button">Connect a New Bank Account</a>
+            </div>
+        );
+    }
+
     if (loading) {
         return (
             <div>
@@ -47,12 +92,23 @@ function Dashboard() {
     }
 
     if (error || !data) {
+        // This part is now mostly for API errors other than auth,
+        // or if the API returns empty data for a logged-in user.
+        // The auth check is handled by ProtectedRoute.
+        if (error) {
+            return (
+                <div>
+                    <h1>Error</h1>
+                    <p>Could not load dashboard data. Please try refreshing the page.</p>
+                    <p style={{ color: 'red', marginTop: '1rem' }}>Error: {error}</p>
+                </div>
+            );
+        }
         return (
             <div>
-                <h1>My Finance Dashboard</h1>
-                <p>Connect your bank accounts to see your financial overview.</p>
-                <a href="/connect" className="button">Connect with TrueLayer</a>
-                {error && <p style={{ color: 'red', marginTop: '1rem' }}>Error: {error}</p>}
+                <h1>Welcome!</h1>
+                <p>Connect your first bank account to see your financial overview.</p>
+                <a href="/connect" className="button">Connect a New Bank Account</a>
             </div>
         );
     }
@@ -79,6 +135,12 @@ function Dashboard() {
                 </div>
             )}
 
+            <ConnectionSection
+                title="Bank Connections"
+                connections={data.connections}
+                onDelete={confirmDisconnect}
+            />
+
             <div ref={accountsContainerRef}>
                 <AccountSection 
                     title="Credit Cards" 
@@ -102,6 +164,97 @@ function Dashboard() {
 
             <div ref={transactionListRef}>
                 {selectedAccount && <TransactionList account={selectedAccount} onClose={handleCloseDetails} />}
+            </div>
+
+            {showDisconnectModal && connectionToDelete && (
+                <div className="modal-overlay" onClick={cancelDisconnect}>
+                    <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h3>Disconnect Bank</h3>
+                            <button onClick={cancelDisconnect} className="close-button">&times;</button>
+                        </div>
+                        <div className="modal-body">
+                            <p>Are you sure you want to disconnect <strong>{connectionToDelete.provider?.display_name || 'this bank'}</strong>?</p>
+                            <p>This will remove the connection and all associated accounts and transactions from your dashboard. This action cannot be undone.</p>
+                        </div>
+                        <div className="modal-footer confirm-buttons">
+                            <button onClick={handleDisconnect} className="button" style={{backgroundColor: '#dc3545'}}>Disconnect</button>
+                            <button onClick={cancelDisconnect} className="button secondary">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+/**
+ * The authentication page for login and signup.
+ */
+function AuthPage() {
+    const { useState } = React;
+    const { login, signup } = useAuth();
+    const [isLogin, setIsLogin] = useState(true);
+    const [email, setEmail] = useState('');
+    const [password, setPassword] = useState('');
+    const [error, setError] = useState('');
+    const [message, setMessage] = useState('');
+    const [loading, setLoading] = useState(false);
+
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setError('');
+        setMessage('');
+        setLoading(true);
+        const action = isLogin ? login : signup;
+        const result = await action(email, password);
+        setLoading(false);
+        if (!result.success) {
+            setError(result.error || 'An unknown error occurred.');
+        } else if (result.message) {
+            // Show confirmation message (e.g., "check your email") and switch to login form
+            setMessage(result.message);
+            setIsLogin(true);
+        }
+    };
+
+    return (
+        <div className="auth-container">
+            <div className="auth-form">
+                <h2>{isLogin ? 'Login' : 'Sign Up'}</h2>
+                <form onSubmit={handleSubmit}>
+                    <div className="form-group">
+                        <label htmlFor="email">Email</label>
+                        <input
+                            type="email"
+                            id="email"
+                            value={email}
+                            onChange={(e) => setEmail(e.target.value)}
+                            required
+                        />
+                    </div>
+                    <div className="form-group">
+                        <label htmlFor="password">Password</label>
+                        <input
+                            type="password"
+                            id="password"
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            required
+                        />
+                    </div>
+                    {error && <p className="error-message">{error}</p>}
+                    {message && <p className="success-message">{message}</p>}
+                    <button type="submit" className="button" disabled={loading}>
+                        {loading ? 'Processing...' : (isLogin ? 'Login' : 'Sign Up')}
+                    </button>
+                </form>
+                <p className="auth-toggle">
+                    {isLogin ? "Don't have an account?" : "Already have an account?"}
+                    <button onClick={() => { setIsLogin(!isLogin); setError(''); setMessage(''); }}>
+                        {isLogin ? 'Sign Up' : 'Login'}
+                    </button>
+                </p>
             </div>
         </div>
     );

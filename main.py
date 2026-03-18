@@ -1,6 +1,8 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import groupby
+import threading
+import re
 
 from functools import wraps
 import math
@@ -9,6 +11,7 @@ import calendar
 from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, session, url_for, jsonify
 import requests 
+from supabase import create_client, Client
 
 import truelayer_api
 
@@ -16,6 +19,11 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("APP_SECRET_KEY")
+
+# --- Supabase Setup ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- Transaction Categorization Logic ---
 
@@ -46,7 +54,16 @@ MERCHANT_TO_CATEGORY = {
 # Add some common categories that might not be in the rules.
 ADDITIONAL_CATEGORIES = ["General", "Income", "Transfers", "Entertainment", "Health"]
 
-def categorize_transaction(description, session):
+def user_has_connections(user_id):
+    """Checks if the user has any linked bank connections."""
+    try:
+        # Using count='exact' to efficiently check for existence
+        res = supabase.table('bank_connections').select("id", count='exact').eq('user_id', user_id).execute()
+        return res.count > 0
+    except Exception:
+        return False
+
+def categorize_transaction(description, rule_overrides):
     """
     Categorizes a transaction based on keywords in its description,
     respecting user-defined rule overrides.
@@ -56,7 +73,6 @@ def categorize_transaction(description, session):
     description_lower = description.lower()
 
     # 1. Check for user-defined rule overrides first
-    rule_overrides = session.get('rule_overrides', {})
     for merchant, category in rule_overrides.items():
         if merchant in description_lower:
             return category
@@ -67,89 +83,191 @@ def categorize_transaction(description, session):
             return category
     return "General"  # 3. Default category if no match is found
 
-def token_required(f):
-    """Decorator to check for access token and handle token refresh."""
+def login_required(f):
+    """Decorator to check if a user is logged in via Supabase."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        access_token = session.get("access_token")
-        if not access_token:
-            return jsonify({"error": "Not authenticated"}), 401
-
-        try:
-            # Try to execute the decorated function (e.g., the API call)
-            return f(access_token, *args, **kwargs)
-        except requests.exceptions.HTTPError as e:
-            # If the external API call fails with 401, try to refresh the token
-            if e.response.status_code == 401:
-                print("Access token expired or invalid. Attempting to refresh...")
-                refresh_token = session.get("refresh_token")
-                if not refresh_token:
-                    return jsonify({"error": "Authentication expired, no refresh token"}), 401
-
-                try:
-                    new_token_data = truelayer_api.refresh_access_token(refresh_token)
-                    session["access_token"] = new_token_data["access_token"]
-                    session["refresh_token"] = new_token_data.get("refresh_token", refresh_token)
-                    print("Token refreshed successfully. Retrying original request.")
-                    # Retry the original function with the new token
-                    return f(session["access_token"], *args, **kwargs)
-                except requests.exceptions.HTTPError as refresh_error:
-                    print(f"Failed to refresh token: {refresh_error}. Logging out.")
-                    session.clear()
-                    return jsonify({"error": "Failed to refresh token"}), 401
-            else:
-                # For other HTTP errors, return a generic server error
-                print(f"An HTTP error occurred: {e}")
-                return jsonify({"error": "An external API error occurred"}), 500
+        user = session.get("user")
+        if not user:
+            return jsonify({"error": "Not authenticated"}), 403
+        return f(user, *args, **kwargs)
     return decorated_function
 
+def sync_truelayer_data(user_id, rule_overrides=None):
+    """
+    Fetches data from all linked TrueLayer connections, persists to Supabase,
+    and handles token refreshing.
+    """
+    if rule_overrides is None:
+        rule_overrides = {}
+    # 1. Get all bank connections for this user
+    response = supabase.table('bank_connections').select("*").eq('user_id', user_id).execute()
+    connections = response.data
+
+    for conn in connections:
+        access_token = conn['access_token']
+        refresh_token = conn['refresh_token']
+        
+        # 2. Attempt to fetch accounts, refresh token if expired
+        accounts = []
+        cards = []
+        try:
+            accounts = truelayer_api.get_accounts(access_token)
+            cards = truelayer_api.get_cards(access_token)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                # Token expired, refresh it
+                try:
+                    new_data = truelayer_api.refresh_access_token(refresh_token)
+                    access_token = new_data['access_token']
+                    refresh_token = new_data.get('refresh_token', refresh_token)
+                    
+                    # Update DB
+                    supabase.table('bank_connections').update({
+                        'access_token': access_token, 
+                        'refresh_token': refresh_token
+                    }).eq('id', conn['id']).execute()
+                    
+                    # Retry fetch
+                    accounts = truelayer_api.get_accounts(access_token)
+                    cards = truelayer_api.get_cards(access_token)
+                except Exception as refresh_err:
+                    print(f"Failed to refresh token for conn {conn['id']}: {refresh_err}")
+                    # If the refresh token is invalid (400) or unauthorized (401), remove the dead connection
+                    if isinstance(refresh_err, requests.exceptions.HTTPError) and refresh_err.response.status_code in (400, 401):
+                        print(f"Removing invalid connection {conn['id']} from database.")
+                        # Assuming ON DELETE CASCADE is enabled for linked accounts/transactions
+                        supabase.table('bank_connections').delete().eq('id', conn['id']).execute()
+                    continue
+            else:
+                print(f"API Error for conn {conn['id']}: {e}")
+                continue
+
+        # 3. Process Accounts & Cards
+        # Tag source to ensure correct API endpoint usage
+        for a in accounts: a['__source'] = 'account'
+        for c in cards: c['__source'] = 'card'
+
+        all_fetched_accounts = accounts + cards
+        for acc in all_fetched_accounts:
+            # Determine account type
+            acc_type = 'CARD' if acc.get('__source') == 'card' else 'TRANSACTION'
+            if 'account_type' in acc: acc_type = acc['account_type'] # Respect API if present
+            
+            # Fetch Balance
+            current_balance = 0.0
+            try:
+                if acc.get('__source') == 'card':
+                    bal_data = truelayer_api.get_card_balance(access_token, acc['account_id'])
+                else:
+                    bal_data = truelayer_api.get_account_balance(access_token, acc['account_id'])
+                
+                current_balance = bal_data.get('current', 0.0)
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 404:
+                    print(f"Balance not found for account {acc['account_id']}, defaulting to 0.0")
+                else:
+                    print(f"Error syncing account {acc['account_id']}: {e}")
+                    continue
+
+            try:
+                # Upsert Account to Supabase
+                supabase.table('accounts').upsert({
+                    'account_id': acc['account_id'],
+                    'connection_id': conn['id'],
+                    'user_id': user_id,
+                    'display_name': acc['display_name'],
+                    'currency': acc['currency'],
+                    'account_type': acc_type,
+                    'provider': acc.get('provider'),
+                    'current_balance': current_balance,
+                    'updated_at': 'now()'
+                }).execute()
+
+                # Fetch & Sync Transactions
+                if acc.get('__source') == 'card':
+                    txs = truelayer_api.get_card_transactions(access_token, acc['account_id'])
+                else:
+                    txs = truelayer_api.get_account_transactions(access_token, acc['account_id'])
+                
+                # Prepare batch insert/upsert for transactions
+                tx_rows = []
+                for tx in txs:
+                    # Apply categorization rules before saving
+                    cat = categorize_transaction(tx.get('description'), rule_overrides)
+                    
+                    tx_rows.append({
+                        'transaction_id': tx['transaction_id'],
+                        'account_id': acc['account_id'],
+                        'user_id': user_id,
+                        'description': tx['description'],
+                        'amount': tx['amount'],
+                        'currency': tx.get('currency'),
+                        'category': cat,
+                        'timestamp': tx['timestamp']
+                    })
+                
+                if tx_rows:
+                    # Upsert to avoid duplicates
+                    supabase.table('transactions').upsert(tx_rows).execute()
+                    
+            except Exception as e:
+                print(f"Error syncing account {acc['account_id']}: {e}")
 
 @app.route('/')
 @app.route('/<path:path>')
 def index(path=None):
-    """
-    Renders the shell that will host the React application.
-    """
     return render_template("layout.html")
 
 @app.route('/api/dashboard')
-@token_required
-def get_dashboard_data(access_token):
-    """
-    Fetches all account and balance data and returns it as JSON.
-    """
-    accounts = truelayer_api.get_accounts(access_token)
-    # cards might be empty if the provider doesn't support it or user has none
-    cards = truelayer_api.get_cards(access_token)
+@login_required
+def get_dashboard_data(user):
+    """Fetches dashboard data from Supabase (unified view)."""
+    user_id = user['id']
+    
+    # Optional: Trigger sync on load, or move this to a background worker / webhook
+    rule_overrides = session.get('rule_overrides', {}).copy()
+    threading.Thread(target=sync_truelayer_data, args=(user_id, rule_overrides)).start()
 
-    for card in cards:
-        card['account_type'] = 'CARD'
-
-    all_accounts = accounts + cards
+    # Query Database
+    db_accounts = supabase.table('accounts').select("*").eq('user_id', user_id).execute().data
+    # You can also fetch transactions from DB to calc todays_change if needed
+    # For simplicity, we calculate totals from the accounts table
 
     total_balance = 0.0
     total_assets = 0.0
     total_liabilities = 0.0
     todays_change = 0.0
-    today_str = datetime.now().strftime('%Y-%m-%d')
+    now = datetime.now()
+    today_str = now.strftime('%Y-%m-%d')
+    tomorrow_str = (now + timedelta(days=1)).strftime('%Y-%m-%d')
 
-    # Iterate through each account to fetch its balance and calculate totals.
-    for account in all_accounts:
-        account_id = account["account_id"]
-        balance = 0.0
-        transactions = []
+    # Create a map of connections to display
+    connections_map = {}
+    for account in db_accounts:
+        conn_id = account.get('connection_id')
+        if conn_id:
+            updated_at = account.get('updated_at')
+            existing = connections_map.get(conn_id)
+            if not existing or (updated_at and (not existing['last_synced'] or updated_at > existing['last_synced'])):
+                connections_map[conn_id] = {
+                    'id': conn_id,
+                    'provider': account.get('provider'),
+                    'last_synced': updated_at
+                }
 
-        if account["account_type"] == "CARD":
-            balance_data = truelayer_api.get_card_balance(access_token, account_id)
-            account["balance"] = balance_data
-            transactions = truelayer_api.get_card_transactions(access_token, account_id)
-        else:
-            balance_data = truelayer_api.get_account_balance(access_token, account_id)
-            account["balance"] = balance_data
-            transactions = truelayer_api.get_account_transactions(access_token, account_id)
+    # Calculate today's change efficiently with a single query
+    today_txs = supabase.table('transactions').select("amount") \
+        .eq('user_id', user_id) \
+        .gte('timestamp', today_str) \
+        .lt('timestamp', tomorrow_str).execute().data
 
-        # Aggregate balances for summary calculations.
-        current_val = balance_data.get('current', 0.0)
+    for tx in today_txs:
+        todays_change += float(tx['amount'])
+
+    # Iterate DB data
+    for account in db_accounts:
+        current_val = float(account['current_balance'])
         total_balance += current_val
 
         if current_val >= 0:
@@ -157,15 +275,12 @@ def get_dashboard_data(access_token):
         else:
             total_liabilities += abs(current_val)
 
-        # Calculate today's change by summing the amounts of today's transactions.
-        # Calculate today's change by summing today's transactions
-        for tx in transactions:
-            if tx['timestamp'].startswith(today_str):
-                todays_change += tx['amount']
+        # Add balance object structure for frontend compatibility
+        account['balance'] = {'current': current_val}
 
-    credit_cards = [acc for acc in all_accounts if acc['account_type'] == 'CARD']
-    savings_accounts = [acc for acc in all_accounts if acc['account_type'] == 'SAVING']
-    debit_accounts = [acc for acc in all_accounts if acc['account_type'] == 'TRANSACTION']
+    credit_cards = [acc for acc in db_accounts if acc['account_type'] == 'CARD']
+    savings_accounts = [acc for acc in db_accounts if acc['account_type'] == 'SAVING']
+    debit_accounts = [acc for acc in db_accounts if acc['account_type'] in ['TRANSACTION', 'BANK']]
 
     # Return all data structured for the frontend.
     return jsonify({
@@ -176,61 +291,64 @@ def get_dashboard_data(access_token):
             "todays_change": round(todays_change, 2),
             "currency": "GBP" # Assuming GBP for simplicity, ideally taken from first account
         },
+        "connections": list(connections_map.values()),
         "credit_cards": credit_cards,
         "savings_accounts": savings_accounts,
         "debit_accounts": debit_accounts
     })
 
 @app.route('/api/breakdown')
-@token_required
-def get_breakdown_data(access_token):
+@login_required
+def get_breakdown_data(user):
     """
     Fetches all transactions and returns spending breakdown by category for the current month as JSON.
     """
-    accounts = truelayer_api.get_accounts(access_token)
-    cards = truelayer_api.get_cards(access_token)
-
-    # Aggregate transactions from all accounts and cards.
-    all_transactions = []
-    for account in accounts:
-        all_transactions.extend(truelayer_api.get_account_transactions(access_token, account["account_id"]))
-    for card in cards:
-        all_transactions.extend(truelayer_api.get_card_transactions(access_token, card["account_id"]))
-
-    # Check if a specific month is requested (YYYY-MM)
     selected_month = request.args.get('month')
-    if selected_month:
-        target_month_str = selected_month
-        # Parse for display name
-        try:
-            month_display = datetime.strptime(selected_month, '%Y-%m').strftime('%B %Y')
-        except ValueError:
-            month_display = selected_month
-    else:
-        target_month_str = datetime.now().strftime('%Y-%m')
-        month_display = datetime.now().strftime('%B %Y')
+    now = datetime.now()
 
-    # Calculate total spending for each category in the target month.
+    if selected_month:
+        try:
+            date_obj = datetime.strptime(selected_month, '%Y-%m')
+        except ValueError:
+            date_obj = now
+    else:
+        date_obj = now
+
+    month_display = date_obj.strftime('%B %Y')
+
+    # Calculate filtered date range
+    start_date = date_obj.replace(day=1).strftime('%Y-%m-%d')
+    next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1)
+    end_date = next_month.strftime('%Y-%m-%d')
+
+    # Query Supabase
+    response = supabase.table('transactions').select("*") \
+        .eq('user_id', user['id']) \
+        .gte('timestamp', start_date) \
+        .lt('timestamp', end_date) \
+        .execute()
+    transactions = response.data
+
     spending_by_category = defaultdict(float)
     overrides = session.get('category_overrides', {})
 
-    for tx in all_transactions:
-        tx_month = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).strftime('%Y-%m')
-        if tx_month == target_month_str and tx['amount'] < 0:
-            tx_id = tx.get('transaction_id')
-            category = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
-            spending_by_category[category] += abs(tx['amount'])
+    for tx in transactions:
+        amount = float(tx['amount'])
+        if amount < 0:
+            tx_id = tx['transaction_id']
+            category = overrides.get(tx_id, tx.get('category') or 'General')
+            spending_by_category[category] += abs(amount)
 
     # Get budget data from session
     budgets = session.get('budgets', {})
 
-    # Combine spending with budget data for a detailed breakdown
-    # Only show categories for which a budget has been defined.
     breakdown_details = []
-    for category in sorted(list(budgets.keys())):
+    all_categories = set(spending_by_category.keys()) | set(budgets.keys())
+
+    for category in sorted(list(all_categories)):
         spent = spending_by_category.get(category, 0)
         budget = float(budgets.get(category, 0))
-        if budget > 0:
+        if spent > 0 or budget > 0:
             remaining = budget - spent
             breakdown_details.append({
                 "category": category,
@@ -251,42 +369,60 @@ def get_breakdown_data(access_token):
         "details": breakdown_details
         })
 
+@app.route('/api/connections/<connection_id>', methods=['DELETE'])
+@login_required
+def delete_connection(user, connection_id):
+    """
+    Deletes a bank_connection and all associated data (accounts, transactions)
+    by leveraging database cascade deletes.
+    """
+    user_id = user['id']
+    try:
+        # The ON DELETE CASCADE on 'accounts' and 'transactions' tables will handle
+        # deleting all associated data.
+        supabase.table('bank_connections').delete().eq('id', connection_id).eq('user_id', user_id).execute()
+        return jsonify({"success": True}), 200
+    except Exception as e:
+        return jsonify({"error": "Failed to delete connection", "details": str(e)}), 500
+
 @app.route('/api/spending_over_time')
-@token_required
-def get_spending_over_time(access_token):
+@login_required
+def get_spending_over_time(user):
     """
     Provides daily spending totals for a given month to power line charts.
     """
-    accounts = truelayer_api.get_accounts(access_token)
-    cards = truelayer_api.get_cards(access_token)
-
-    all_transactions = []
-    for account in accounts:
-        all_transactions.extend(truelayer_api.get_account_transactions(access_token, account["account_id"]))
-    for card in cards:
-        all_transactions.extend(truelayer_api.get_card_transactions(access_token, card["account_id"]))
-
     selected_month = request.args.get('month')
-    if not selected_month:
-        return jsonify({"error": "month parameter is required"}), 400
+    now = datetime.now()
+    if selected_month:
+        try:
+            date_obj = datetime.strptime(selected_month, '%Y-%m')
+        except ValueError:
+            date_obj = now
+    else:
+        date_obj = now
 
-    # Filter transactions for the selected month
-    month_transactions = [tx for tx in all_transactions if tx['timestamp'].startswith(selected_month)]
+    start_date = date_obj.replace(day=1).strftime('%Y-%m-%d')
+    next_month = (date_obj.replace(day=28) + timedelta(days=4)).replace(day=1)
+    end_date = next_month.strftime('%Y-%m-%d')
+
+    response = supabase.table('transactions').select("*") \
+        .eq('user_id', user['id']) \
+        .gte('timestamp', start_date) \
+        .lt('timestamp', end_date) \
+        .execute()
+    transactions = response.data
 
     daily_spending = defaultdict(float)
-    for tx in month_transactions:
-        if tx['amount'] < 0:
+    for tx in transactions:
+        if float(tx['amount']) < 0:
             day = datetime.fromisoformat(tx['timestamp'].replace('Z', '+00:00')).day
-            daily_spending[day] += abs(tx['amount'])
+            daily_spending[day] += abs(float(tx['amount']))
 
-    # Get the number of days in the selected month
-    try:
-        year, month_num = map(int, selected_month.split('-'))
-        num_days = calendar.monthrange(year, month_num)[1]
-    except ValueError:
-        return jsonify({"error": "Invalid month format. Use YYYY-MM."}), 400
+    # Days in the selected month
+    num_days = calendar.monthrange(date_obj.year, date_obj.month)[1]
     
     labels = [f"Day {day}" for day in range(1, num_days + 1)]
+    # Cumulative spending logic
     data = [round(sum(daily_spending.get(d, 0) for d in range(1, day + 1)), 2) for day in range(1, num_days + 1)]
 
     return jsonify({
@@ -296,79 +432,65 @@ def get_spending_over_time(access_token):
     })
 
 @app.route('/api/account_transactions')
-@token_required
-def get_single_account_transactions(access_token):
-    """Fetches recent transactions for a single account."""
+@login_required
+def get_single_account_transactions(user):
+    """Fetches recent transactions for a single account from the database."""
     account_id = request.args.get('account_id')
-    account_type = request.args.get('account_type')
+    user_id = user['id']
 
-    # Ensure required parameters are provided.
     if not account_id:
         return jsonify({"error": "account_id is required"}), 400
 
-    transactions = []
-    if account_type == 'CARD':
-        transactions = truelayer_api.get_card_transactions(access_token, account_id)
-    else:
-        transactions = truelayer_api.get_account_transactions(access_token, account_id)
-
+    # Query DB for transactions for this account and user
+    response = supabase.table('transactions').select("*") \
+        .eq('user_id', user_id) \
+        .eq('account_id', account_id) \
+        .order('timestamp', desc=True) \
+        .limit(15) \
+        .execute()
+    
+    transactions = response.data
+    
     overrides = session.get('category_overrides', {})
-    # Add our custom category to each transaction
+    rule_overrides = session.get('rule_overrides', {})
     for tx in transactions:
         tx_id = tx.get('transaction_id')
-        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
+        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
 
-    # Sort by date descending (newest first)
-    transactions.sort(key=lambda x: x['timestamp'], reverse=True)
-    # Return only the top 15 most recent transactions for the detail view.
-    # Return up to 15 recent transactions for the detail view
-    return jsonify(transactions[:15])
+    return jsonify(transactions)
 
 
 @app.route('/api/transactions')
-@token_required
-def get_transactions_data(access_token):
+@login_required
+def get_transactions_data(user):
     """
     Fetches all transactions from all accounts and returns them as a sorted list.
     """
-    accounts = truelayer_api.get_accounts(access_token)
-    cards = truelayer_api.get_cards(access_token)
+    # Fetch all transactions from DB sorted by date
+    response = supabase.table('transactions').select("*").eq('user_id', user['id']).order('timestamp', desc=True).execute()
+    all_transactions = response.data
 
+    # Get account names for display
+    acc_response = supabase.table('accounts').select("account_id, display_name").eq('user_id', user['id']).execute()
+    acc_map = {acc['account_id']: acc['display_name'] for acc in acc_response.data}
+    
     overrides = session.get('category_overrides', {})
-    # Aggregate transactions from all accounts, adding the account name for context.
-    all_transactions = []
 
-    # Fetch transactions and append account name for context
-    for account in accounts:
-        txs = truelayer_api.get_account_transactions(access_token, account["account_id"])
-        for tx in txs:
-            tx['account_name'] = account['display_name']
-            tx_id = tx.get('transaction_id')
-            tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
-            all_transactions.append(tx)
-
-    for card in cards:
-        txs = truelayer_api.get_card_transactions(access_token, card["account_id"])
-        for tx in txs:
-            tx['account_name'] = card['display_name']
-            tx_id = tx.get('transaction_id')
-            tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), session))
-            all_transactions.append(tx)
-
-    # Sort by date descending (newest first)
-    all_transactions.sort(key=lambda x: x['timestamp'], reverse=True)
+    for tx in all_transactions:
+        tx['account_name'] = acc_map.get(tx['account_id'], 'Unknown Account')
+        tx_id = tx['transaction_id']
+        # Use session override or DB category
+        tx['display_category'] = overrides.get(tx_id, tx.get('category') or 'General')
 
     # --- Month Filter ---
-    # Allows fetching transactions for a specific month, used by the breakdown drill-down.
     month_filter = request.args.get('month')
     if month_filter:
         all_transactions = [tx for tx in all_transactions if tx['timestamp'].startswith(month_filter)]
 
     # --- Category Filter ---
-    # Allows fetching transactions for a specific category, used by the breakdown drill-down.
     category_filter = request.args.get('category')
     if category_filter:
-        all_transactions = [tx for tx in all_transactions if tx.get('display_category') == category_filter and tx['amount'] < 0]
+        all_transactions = [tx for tx in all_transactions if tx.get('display_category') == category_filter and float(tx['amount']) < 0]
 
     # If a search query is provided, filter transactions by description or amount.
     # --- Search Logic ---
@@ -377,7 +499,7 @@ def get_transactions_data(access_token):
         filtered_txs = []
         for tx in all_transactions:
             # Check description or amount (converted to string)
-            if search_query in tx.get('description', '').lower() or search_query in str(tx.get('amount', '')):
+            if search_query in tx.get('description', '').lower() or search_query in str(tx['amount']):
                 filtered_txs.append(tx)
         all_transactions = filtered_txs
 
@@ -406,8 +528,8 @@ def get_transactions_data(access_token):
 
 
 @app.route('/api/categories')
-@token_required
-def get_categories(access_token):
+@login_required
+def get_categories(user):
     """Returns a list of available transaction categories."""
     # Get all unique categories from the rules
     categories = set(MERCHANT_TO_CATEGORY.values())
@@ -417,8 +539,8 @@ def get_categories(access_token):
 
 
 @app.route('/api/categorize', methods=['POST'])
-@token_required
-def set_transaction_category(access_token):
+@login_required
+def set_transaction_category(user):
     """Sets a manual category override for a given transaction."""
     data = request.get_json()
     transaction_id = data.get('transaction_id')
@@ -437,8 +559,8 @@ def set_transaction_category(access_token):
     return jsonify({"success": True, "transaction_id": transaction_id, "category": category})
 
 @app.route('/api/categorize_rule', methods=['POST'])
-@token_required
-def set_categorization_rule(access_token):
+@login_required
+def set_categorization_rule(user):
     """Creates a new rule to categorize all transactions from a vendor."""
     data = request.get_json()
     description = data.get('description')
@@ -447,28 +569,35 @@ def set_categorization_rule(access_token):
     if not description or not category:
         return jsonify({"error": "description and category are required"}), 400
 
-    # Find the merchant keyword from the description
     description_lower = description.lower()
     found_merchant = None
+
+    # 1. First, try to match against existing hardcoded rules to find a canonical key
     for merchant in MERCHANT_TO_CATEGORY.keys():
         if merchant in description_lower:
             found_merchant = merchant
             break
     
+    # 2. If no canonical merchant is found, create a new rule key from the description
     if not found_merchant:
-        return jsonify({"error": f"Could not determine a merchant rule for '{description}'"}), 400
+        # Heuristic: Use the first "word" of the description as the new rule key.
+        words = re.findall(r'\b[a-z0-9-]+\b', description_lower)
+        if words:
+            found_merchant = words[0]
 
     if 'rule_overrides' not in session:
         session['rule_overrides'] = {}
     
-    session['rule_overrides'][found_merchant] = category
-    session.modified = True
-
-    return jsonify({"success": True, "rule": {found_merchant: category}})
+    if found_merchant:
+        session['rule_overrides'][found_merchant] = category
+        session.modified = True
+        return jsonify({"success": True, "rule": {found_merchant: category}})
+    else:
+        return jsonify({"error": f"Could not determine a merchant rule for '{description}'"}), 400
 
 @app.route('/api/budgets', methods=['GET', 'POST'])
-@token_required
-def handle_budgets(access_token):
+@login_required
+def handle_budgets(user):
     """Handles getting and setting monthly budgets per category."""
     if request.method == 'POST':
         # Sanitize and save the budgets posted by the user
@@ -483,6 +612,48 @@ def handle_budgets(access_token):
     budgets = session.get('budgets', {})
     return jsonify(budgets)
 
+@app.route('/api/session')
+def get_session_status():
+    """Checks if a user is logged in and returns user data if available."""
+    user = session.get('user')
+    if user:
+        has_conn = user_has_connections(user['id'])
+        return jsonify({"logged_in": True, "user": user, "has_connections": has_conn})
+    else:
+        return jsonify({"logged_in": False})
+
+# --- Auth Routes ---
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    try:
+        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+        session['user'] = res.user.model_dump(mode='json') # store user info in session
+        has_conn = user_has_connections(res.user.id)
+        return jsonify({"success": True, "user": session['user'], "has_connections": has_conn})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/api/signup', methods=['POST'])
+def signup():
+    data = request.get_json()
+    email = data.get('email')
+    password = data.get('password')
+    try:
+        res = supabase.auth.sign_up({"email": email, "password": password})
+        # If email confirmation is disabled, Supabase returns a session.
+        # We can use this to log the user in immediately.
+        if res.session:
+            session['user'] = res.user.model_dump(mode='json')
+            return jsonify({"success": True, "user": session['user'], "has_connections": False})
+        else:
+            # If email confirmation is enabled, no session is returned.
+            return jsonify({"success": True, "message": "Check your email to confirm signup."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
 
 @app.route('/connect')
 def connect():
@@ -495,16 +666,27 @@ def callback():
     """Handles the callback from TrueLayer, exchanges the code for a token."""
     code = request.args.get("code")
     token_data = truelayer_api.exchange_code_for_token(code)
-    session["access_token"] = token_data["access_token"]
-    # Store the refresh_token as well to handle future token expiry
-    session["refresh_token"] = token_data["refresh_token"]
+    
+    user = session.get('user')
+    if user:
+        # Persist tokens to Supabase linked to the user
+        supabase.table('bank_connections').insert({
+            'user_id': user['id'],
+            'access_token': token_data['access_token'],
+            'refresh_token': token_data['refresh_token']
+        }).execute()
+        
+        # Trigger immediate sync
+        rule_overrides = session.get('rule_overrides', {}).copy()
+        threading.Thread(target=sync_truelayer_data, args=(user['id'], rule_overrides)).start()
+
     return redirect(url_for("index"))
 
-@app.route('/logout')
+@app.route('/api/logout', methods=['POST'])
 def logout():
-    """Clears the session."""
+    """Clears the session and logs the user out."""
     session.clear()
-    return redirect(url_for("index"))
+    return jsonify({"success": True, "message": "Logged out successfully."})
 
 if __name__ == '__main__':
     app.run(debug=True)

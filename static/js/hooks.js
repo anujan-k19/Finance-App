@@ -26,11 +26,14 @@ function useFetch(url) {
         }
         const fetchData = async () => {
             setLoading(true);
+            setError(null); // Reset error on new fetch
             try {
                 const response = await fetch(url);
                 if (!response.ok) {
-                    if (response.status === 401) {
-                         // Not authenticated - return null data but stop loading
+                    // The backend now returns 403 for auth errors
+                    if (response.status === 403) {
+                         // Not authenticated. The ProtectedRoute will handle the redirect.
+                         // We just need to ensure we don't show an error.
                         setData(null);
                         return;
                     }
@@ -48,4 +51,17 @@ function useFetch(url) {
     }, [url, trigger]); // Dependency array includes trigger to allow refetching.
 
     return { data, loading, error, refetch };
+}
+
+/**
+ * Context to hold authentication state.
+ * Defined here to be globally available to pages.js and app.js.
+ */
+const AuthContext = React.createContext(null);
+
+/**
+ * Hook to use the auth context.
+ */
+function useAuth() {
+    return React.useContext(AuthContext);
 }

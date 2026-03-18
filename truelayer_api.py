@@ -2,8 +2,8 @@ import os
 import requests
 from urllib.parse import urlencode, quote
 
-TRUELAYER_AUTH_URL = "https://auth.truelayer-sandbox.com/"
-TRUELAYER_API_URL = "https://api.truelayer-sandbox.com/"
+TRUELAYER_AUTH_URL = "https://auth.truelayer.com/"
+TRUELAYER_API_URL = "https://api.truelayer.com/"
 
 CLIENT_ID = os.getenv("TRUELAYER_CLIENT_ID")
 CLIENT_SECRET = os.getenv("TRUELAYER_CLIENT_SECRET")
@@ -17,11 +17,11 @@ def get_auth_link():
         "client_id": CLIENT_ID,
         "scope": "info accounts balance cards transactions direct_debits standing_orders offline_access",
         "redirect_uri": REDIRECT_URI,
-        "providers": "uk-cs-mock uk-ob-all uk-oauth-all",
+        "providers": "uk-ob-all uk-oauth-all",
     }
-    # Use quote_via=quote to encode spaces as %20 and keep ':' and '/' unencoded.
-    auth_url = f"{TRUELAYER_AUTH_URL}?{urlencode(params, quote_via=quote, safe=':/')}"
-    print(f"Generated Auth URL: {auth_url}")
+    # Use quote_via=quote to encode spaces as %20.
+    auth_url = f"{TRUELAYER_AUTH_URL}?{urlencode(params, quote_via=quote)}"
+    print(auth_url)
     return auth_url
 
 
@@ -55,9 +55,11 @@ def refresh_access_token(refresh_token):
 def get_api_data(endpoint, access_token):
     """Generic function to make authenticated requests to the TrueLayer Data API."""
     headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(f"{TRUELAYER_API_URL}data/v1/{endpoint}", headers=headers)
+    full_url = f"{TRUELAYER_API_URL}data/v1/{endpoint}"
+    response = requests.get(full_url, headers=headers)
     response.raise_for_status()
-    return response.json()["results"]
+    json_response = response.json()
+    return json_response["results"]
 
 
 def get_accounts(access_token):

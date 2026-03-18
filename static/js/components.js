@@ -3,13 +3,13 @@
  * @param {{account: object, onClick: function, isSelected: boolean}} props
  * @returns {JSX.Element}
  */
-function Account({ account, onClick, isSelected }) {
+function Account({ account, onClick, isSelected, onDelete }) {
     const cardClass = `account ${isSelected ? 'selected' : ''}`;
     return (
         <div className={cardClass} onClick={onClick}>
             <div className="account-card-header">
                 <h3>{account.display_name}</h3>
-                <span className="account-provider">{account.provider.display_name}</span>
+                <span className="account-provider">{account.provider?.display_name}</span>
             </div>
             <div className="account-card-body">
                 <p className="account-balance">
@@ -17,6 +17,60 @@ function Account({ account, onClick, isSelected }) {
                 </p>
             </div>
         </div>
+    );
+}
+
+/**
+ * A presentational component for a single bank connection card.
+ * @param {{connection: object, onDelete: function}} props
+ * @returns {JSX.Element}
+ */
+function ConnectionCard({ connection, onDelete }) {
+    // Use the account card styling for a consistent look
+    return (
+        <div className="account">
+            <div className="account-card-header">
+                <h3>{connection.provider?.display_name || 'Bank Connection'}</h3>
+                <div className="account-header-actions">
+                    <button 
+                        className="delete-account-btn"
+                        title="Disconnect Bank"
+                        onClick={(e) => { e.stopPropagation(); onDelete(connection); }}
+                    >
+                        &times;
+                    </button>
+                </div>
+            </div>
+            <div className="account-card-body">
+                {/* You can add more details here if needed, e.g., connection date */}
+                <p className="account-balance" style={{fontSize: '1rem', color: '#6c757d'}}>
+                    {connection.last_synced ? `Synced ${new Date(connection.last_synced).toLocaleString()}` : 'Ready to sync'}
+                </p>
+            </div>
+        </div>
+    );
+}
+
+/**
+ * A card component that serves as a button to add a new connection.
+ * @returns {JSX.Element}
+ */
+function AddConnectionCard() {
+    return (
+        <a href="/connect" className="account" style={{ 
+            display: 'flex', 
+            flexDirection: 'column', 
+            alignItems: 'center', 
+            justifyContent: 'center', 
+            textDecoration: 'none', 
+            cursor: 'pointer',
+            borderStyle: 'dashed',
+            backgroundColor: '#f8f9fa',
+            minHeight: '130px'
+        }}>
+            <div style={{ fontSize: '2.5rem', color: '#6c757d', lineHeight: '1', marginBottom: '0.5rem' }}>+</div>
+            <div style={{ fontWeight: 'bold', color: '#495057' }}>Link Bank</div>
+        </a>
     );
 }
 
@@ -59,7 +113,7 @@ function LoadingSpinner() {
  * @param {{title: string, accounts: Array<object>, onAccountSelect: function, selectedAccountId: string|null}} props
  * @returns {JSX.Element}
  */
-function AccountSection({ title, accounts, onAccountSelect, selectedAccountId }) {
+function AccountSection({ title, accounts, onAccountSelect, selectedAccountId, onDelete }) {
     return (
         <div className="account-section">
             <h2>{title}</h2>
@@ -76,6 +130,29 @@ function AccountSection({ title, accounts, onAccountSelect, selectedAccountId })
                 ) : (
                     <p>No {title.toLowerCase()} found.</p>
                 )}
+            </div>
+        </div>
+    );
+}
+
+/**
+ * A container component that displays a grid of connection cards.
+ * @param {{title: string, connections: Array<object>, onDelete: function}} props
+ * @returns {JSX.Element}
+ */
+function ConnectionSection({ title, connections, onDelete }) {
+    return (
+        <div className="account-section">
+            <h2>{title}</h2>
+            <div className="account-grid">
+                {connections && connections.map(conn => 
+                    <ConnectionCard 
+                        key={conn.id} 
+                        connection={conn} 
+                        onDelete={onDelete}
+                    />
+                )}
+                <AddConnectionCard />
             </div>
         </div>
     );
@@ -337,11 +414,18 @@ function TransactionDetailModal({ transaction, categories, onClose, onSave }) {
  */
 function Layout() {
     const { useState } = React;
-    const { Link, Outlet } = ReactRouterDOM;
+    const { Link, Outlet } = ReactRouterDOM;    
+    const { logout } = useAuth();
     const [isMenuOpen, setIsMenuOpen] = useState(false);
 
     const toggleMenu = () => setIsMenuOpen(!isMenuOpen);
     const closeMenu = () => setIsMenuOpen(false);
+
+    const handleLogout = (e) => {
+        e.preventDefault();
+        closeMenu();
+        logout();
+    };
 
     return (
         <div>
@@ -358,7 +442,7 @@ function Layout() {
                         <li><Link to="/transactions" onClick={closeMenu}>Transactions</Link></li>
                         <li><Link to="/budgets" onClick={closeMenu}>Budgets</Link></li>
                         <li><Link to="/breakdown" onClick={closeMenu}>Spending Breakdown</Link></li>
-                        <li><a href="/logout" onClick={closeMenu}>Logout</a></li>
+                        <li><a href="#" onClick={handleLogout}>Logout</a></li>
                     </ul>
                 </div>
             </nav>
@@ -404,6 +488,7 @@ function SpendingChart({ data, onCategoryClick }) {
                 },
                 options: {
                     responsive: true,
+                    maintainAspectRatio: false, // This allows the chart to fill the container's dimensions, ensuring it's centered.
                     plugins: {
                         legend: { position: 'top' },
                         title: { display: true, text: 'Spending by Category' }
@@ -431,7 +516,8 @@ function SpendingChart({ data, onCategoryClick }) {
     }, [data, onCategoryClick]); // Rerun effect if data or click handler changes
 
     return (
-        <div className="chart-container" style={{position: 'relative', height: '60vh', width: '60vw', margin: 'auto'}}>
+        // The .chart-container class from style.css will now handle all sizing and centering.
+        <div className="chart-container">
             <canvas ref={chartRef}></canvas>
         </div>
     );
