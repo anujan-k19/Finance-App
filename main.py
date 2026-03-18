@@ -12,6 +12,26 @@ from dotenv import load_dotenv
 from flask import Flask, redirect, render_template, request, session, url_for, jsonify
 import requests 
 from supabase import create_client, Client
+import ssl
+import urllib3
+import certifi
+
+# Configure SSL to use certifi's certificates
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
+
+try:
+    from sklearn.feature_extraction.text import CountVectorizer
+    from sklearn.naive_bayes import MultinomialNB
+    from sklearn.pipeline import make_pipeline
+except ImportError:
+    print("Scikit-learn not found. ML features will be disabled.")
+
+try:
+    from transformers import pipeline
+except ImportError:
+    print("Transformers not found. Deep learning features will be disabled.")
+    pipeline = None
 
 import truelayer_api
 
@@ -63,7 +83,65 @@ def user_has_connections(user_id):
     except Exception:
         return False
 
-def categorize_transaction(description, rule_overrides):
+def get_user_history_map(user_id):
+    """Fetches a map of {description: category} for all non-General transactions."""
+    history_response = supabase.table('transactions') \
+        .select('description, category') \
+        .eq('user_id', user_id) \
+        .neq('category', 'General') \
+        .execute()
+    return {row['description'].lower(): row['category'] for row in history_response.data}
+
+def train_categorization_model(history_map):
+    """
+    Trains a lightweight Naive Bayes classifier using the user's history.
+    Returns the trained pipeline or None if there isn't enough data.
+    """
+    if not history_map or len(history_map) < 5:
+        return None
+
+    descriptions = list(history_map.keys())
+    categories = list(history_map.values())
+
+    # We need at least 2 different categories to train a classifier
+    if len(set(categories)) < 2:
+        return None
+
+    model = make_pipeline(CountVectorizer(), MultinomialNB())
+    model.fit(descriptions, categories)
+    return model
+
+_zero_shot_classifier = None
+_ner_pipeline = None
+
+def extract_merchant(description):
+    """Extracts merchant name from description using NER."""
+    if not description or not pipeline:
+        return None
+    
+    global _ner_pipeline
+    if _ner_pipeline is None:
+        print("Loading NER Model...")
+        try:
+            _ner_pipeline = pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple")
+        except Exception as e:
+            print(f"Failed to load NER model: {e}")
+            return None
+
+    try:
+        # Heuristic: Title case improves NER on ALL CAPS bank descriptions
+        text_to_analyze = description
+        if description.isupper():
+            text_to_analyze = description.title()
+        entities = _ner_pipeline(text_to_analyze)
+        for entity in entities:
+            if entity['entity_group'] == 'ORG':
+                return entity['word']
+    except Exception:
+        pass
+    return None
+
+def categorize_transaction(description, rule_overrides, history_map=None, model=None, known_merchant_name=None):
     """
     Categorizes a transaction based on keywords in its description,
     respecting user-defined rule overrides.
@@ -72,16 +150,56 @@ def categorize_transaction(description, rule_overrides):
         return "General"
     description_lower = description.lower()
 
-    # 1. Check for user-defined rule overrides first
+    # 1. Check history for exact description match (Implicit learning - Specific)
+    if history_map and description_lower in history_map:
+        return history_map[description_lower]
+
+    # 2. Check for user-defined rule overrides (Explicit rules - General/Keyword)
     for merchant, category in rule_overrides.items():
         if merchant in description_lower:
             return category
 
-    # 2. Check hardcoded rules next
+    # 3. Check hardcoded rules next
     for merchant, category in MERCHANT_TO_CATEGORY.items():
         if merchant in description_lower:
             return category
-    return "General"  # 3. Default category if no match is found
+
+    # 4. Try Machine Learning Model
+    if model:
+        try:
+            # Predict returns a list, take the first item
+            return model.predict([description])[0]
+        except Exception:
+            pass
+
+    # 5. Try NER to extract merchant name (to improve Zero-Shot accuracy)
+    extracted_merchant = known_merchant_name
+    if not extracted_merchant and pipeline:
+        # Only run NER if we don't already have the name
+        extracted_merchant = extract_merchant(description)
+
+    # 6. Try Pretrained Zero-Shot Classification (Deep Learning)
+    if pipeline:
+        global _zero_shot_classifier
+        # Lazy load the model only when needed to improve startup time
+        if _zero_shot_classifier is None:
+            print("Loading Zero-Shot Classification Model...")
+            try:
+                _zero_shot_classifier = pipeline("zero-shot-classification", model="valhalla/distilbart-mnli-12-3")
+            except Exception as e:
+                print(f"Failed to load Zero-Shot model: {e}")
+
+        if _zero_shot_classifier:
+            candidate_labels = list(set(MERCHANT_TO_CATEGORY.values()) | set(ADDITIONAL_CATEGORIES))
+            try:
+                # Prefer the extracted merchant name if available, otherwise use full description
+                text_to_classify = extracted_merchant if extracted_merchant else description
+                result = _zero_shot_classifier(text_to_classify, candidate_labels)
+                return result['labels'][0]
+            except Exception as e:
+                print(f"Zero-shot prediction failed: {e}")
+
+    return "General"  # 6. Default category if no match is found
 
 def login_required(f):
     """Decorator to check if a user is logged in via Supabase."""
@@ -101,6 +219,12 @@ def sync_truelayer_data(user_id):
     # Fetch user-specific categorization rules from the database
     rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user_id).execute()
     rule_overrides = {rule['merchant_keyword']: rule['category'] for rule in rules_response.data}
+
+    # Build history map for implicit learning from past transactions
+    history_map = get_user_history_map(user_id)
+
+    # Train ML model on the fly using history
+    model = train_categorization_model(history_map)
 
     # 1. Get all bank connections for this user
     response = supabase.table('bank_connections').select("*").eq('user_id', user_id).execute()
@@ -195,14 +319,18 @@ def sync_truelayer_data(user_id):
                 # Prepare batch insert/upsert for transactions
                 tx_rows = []
                 for tx in txs:
+                    description = tx.get('description')
+                    # Extract merchant name to save to DB
+                    merchant_name = extract_merchant(description)
                     # Apply categorization rules before saving
-                    cat = categorize_transaction(tx.get('description'), rule_overrides)
+                    cat = categorize_transaction(description, rule_overrides, history_map, model, known_merchant_name=merchant_name)
                     
                     tx_rows.append({
                         'transaction_id': tx['transaction_id'],
                         'account_id': acc['account_id'],
                         'user_id': user_id,
-                        'description': tx['description'],
+                        'description': description,
+                        'merchant_name': merchant_name,
                         'amount': tx['amount'],
                         'currency': tx.get('currency'),
                         'category': cat,
@@ -338,6 +466,12 @@ def get_breakdown_data(user):
     rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
     rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
 
+    # Build history map
+    history_map = get_user_history_map(user['id'])
+
+    # Train ML model
+    model = train_categorization_model(history_map)
+
     for tx in transactions:
         amount = float(tx['amount'])
         if amount < 0:
@@ -346,7 +480,7 @@ def get_breakdown_data(user):
             # 1. Manual override for this specific transaction ("Just this one")
             # 2. Rule-based override for the merchant ("All similar")
             # 3. Default rule-based categorization
-            category = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
+            category = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides, history_map, model, known_merchant_name=tx.get('merchant_name')))
             spending_by_category[category] += abs(amount)
 
     # Get budget data from session
@@ -468,9 +602,15 @@ def get_single_account_transactions(user):
     rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
     rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
 
+    # Build history map
+    history_map = get_user_history_map(user['id'])
+
+    # Train ML model
+    model = train_categorization_model(history_map)
+
     for tx in transactions:
         tx_id = tx.get('transaction_id')
-        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
+        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides, history_map, model, known_merchant_name=tx.get('merchant_name')))
 
     return jsonify(transactions)
 
@@ -496,6 +636,12 @@ def get_transactions_data(user):
     rules_response = supabase.table('user_category_rules').select('merchant_keyword, category').eq('user_id', user['id']).execute()
     rule_overrides = {item['merchant_keyword']: item['category'] for item in rules_response.data}
 
+    # Build history map
+    history_map = get_user_history_map(user['id'])
+
+    # Train ML model
+    model = train_categorization_model(history_map)
+
     for tx in all_transactions:
         tx['account_name'] = acc_map.get(tx['account_id'], 'Unknown Account')
         tx_id = tx['transaction_id']
@@ -503,7 +649,7 @@ def get_transactions_data(user):
         # 1. Manual override for this specific transaction ("Just this one")
         # 2. Rule-based override for the merchant ("All similar")
         # 3. Default rule-based categorization
-        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides))
+        tx['display_category'] = overrides.get(tx_id, categorize_transaction(tx.get('description'), rule_overrides, history_map, model, known_merchant_name=tx.get('merchant_name')))
 
     # --- Month Filter ---
     month_filter = request.args.get('month')

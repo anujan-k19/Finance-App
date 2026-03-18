@@ -166,7 +166,7 @@ function ConnectionSection({ title, connections, onDelete }) {
 function TransactionRow({ transaction, onClick, showAccountName = false }) {
     return (
         <tr onClick={onClick} className="clickable-row">
-            <td>{transaction.description}</td>
+            <td>{transaction.merchant_name || transaction.description}</td>
             <td>{transaction.display_category}</td>
             {showAccountName && <td>{transaction.account_name}</td>}
             <td style={{ textAlign: 'right', fontWeight: transaction.amount > 0 ? 'bold' : 'normal', color: transaction.amount > 0 ? '#28a745' : 'inherit' }}>
@@ -243,7 +243,7 @@ function TransactionList({ account, onClose }) {
                             }
                             acc.push(
                                 <tr key={tx.transaction_id || index}>
-                                    <td>{tx.description}</td>
+                                    <td>{tx.merchant_name || tx.description}</td>
                                     <td>{tx.display_category}</td>
                                     <td style={{ textAlign: 'right', color: tx.amount > 0 ? '#28a745' : 'inherit' }}>
                                         {tx.amount.toLocaleString('en-GB', { style: 'currency', currency: tx.currency || 'GBP' })}
@@ -311,7 +311,7 @@ function CategoryTransactionList({ category, month, onClose }) {
                             }
                             acc.push(
                                 <tr key={tx.transaction_id}>
-                                    <td>{tx.description}</td>
+                                    <td>{tx.merchant_name || tx.description}</td>
                                     <td>{tx.account_name}</td>
                                     <td style={{ textAlign: 'right' }}>
                                         {tx.amount.toLocaleString('en-GB', { style: 'currency', currency: tx.currency || 'GBP' })}
